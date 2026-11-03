@@ -246,6 +246,7 @@ fn parse_glyf_t0(i: &[u8]) -> Result<Vec<Shape>, FontError> {
                 // running position is a sum over the whole contour. Accumulating in `i16`
                 // overflows on a font whose points drift past ±32767 (audit §3), so it is
                 // summed in `i32` and turned into coordinates at the end.
+                let mut glyph_points: Vec<Vector2F> = Vec::new();
                 let (mut x, mut y) = (0i32, 0i32);
                 for n_points in (&mut points).take(n_contour as usize) {
                     // The flag stream and the glyph stream are separate, so a truncated font
@@ -279,11 +280,12 @@ fn parse_glyf_t0(i: &[u8]) -> Result<Vec<Shape>, FontError> {
 
                         contour_points.push((on_curve, Vector2F::new(x as f32, y as f32)));
                     }
+                    glyph_points.extend(contour_points.iter().map(|&(_, point)| point));
                     if let Some(contour) = contour(contour_points.into_iter()) {
                         outline.push_contour(contour);
                     }
                 }
-                glyphs.push(Shape::Simple(outline));
+                glyphs.push(Shape::Simple(outline, glyph_points));
                 let _num_instructions = parse(&mut glyph_stream, varint_u16)?;
             }
             n => error!("invalid number of contours: {}", n)

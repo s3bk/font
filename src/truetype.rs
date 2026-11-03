@@ -50,7 +50,11 @@ pub struct Component {
 
 #[derive(Clone)]
 pub enum Shape {
-    Simple(Outline),
+    /// The outline and, beside it, the glyph's own points exactly as `glyf` numbers them
+    /// (continuously over all contours, no implied or closing points): the outline holds the
+    /// converted curves, which cannot be mapped back to the point numbers that composite
+    /// glyphs place their components by.
+    Simple(Outline, Vec<Vector2F>),
     Compound(Vec<Component>),
     Empty
 }
@@ -325,42 +329,6 @@ pub fn compound(mut input: &[u8]) -> R<Shape> {
     Ok((input, Shape::Compound(parts)))
 }
 
-/// The points of a contour without the closing point that `contour()` appends, i.e. the
-/// numbering OT §glyf uses for point matching.
-///
-/// `contour()` always ends a glyph contour at its start point — a closing line, a closing
-/// quadratic, or the implied on-curve point between two off-curve points — so the last point of
-/// every contour built there repeats the first, and dropping it restores the glyph's own
-/// numbering exactly, including for a glyph whose last point genuinely repeats its first (the
-/// fabricated point is still there, after it).
-///
-/// Two things still shift the numbering: an implied on-curve midpoint inserted between two
-/// consecutive off-curve points, and quadratic-to-cubic conversion (the control points are then
-/// stored as two cubic control points). Point matching in such a contour therefore refers to the
-/// converted outline, not to `glyf` — fixing that needs the original numbering kept beside the
-/// outline, which `pathfinder_content::outline::Contour` has no room for.
-fn spec_points(contour: &Contour) -> &[Vector2F] {
-    let points = contour.points();
-    if points.len() > 1 && points[0] == points[points.len() - 1] {
-        &points[.. points.len() - 1]
-    } else {
-        points
-    }
-}
-
-/// Point `index` of an outline, counting continuously over its contours (§glyf point numbers).
-fn point_at(outline: &Outline, index: u16) -> Option<Vector2F> {
-    let mut n = index as usize;
-    for contour in outline.contours() {
-        let points = spec_points(contour);
-        if n < points.len() {
-            return Some(points[n]);
-        }
-        n -= points.len();
-    }
-    None
-}
-
 /// A composite glyph may nest; the spec also forbids a glyph that contains itself. Both are
 /// bounded here so a malformed font cannot loop or overflow the stack.
 const MAX_COMPONENT_DEPTH: usize = 16;
@@ -428,33 +396,44 @@ impl ComponentBudget {
 
 pub fn get_outline(shapes: &[Shape], idx: u32) -> Option<Outline> {
     let mut budget = ComponentBudget::new();
-    expand_outline(shapes, idx, &mut Vec::new(), &mut budget)
+    expand_outline(shapes, idx, &mut Vec::new(), &mut budget).map(|(outline, _points)| outline)
 }
 
-fn expand_outline(shapes: &[Shape], idx: u32, stack: &mut Vec<u32>, budget: &mut ComponentBudget) -> Option<Outline> {
+/// The outline of glyph `idx` and its points in `glyf` numbering. For a composite the numbering
+/// is that of its components' points, in order, each transformed like its outline (OT §glyf:
+/// a component is placed by matching one of its points to one of the points of the composite
+/// built so far).
+fn expand_outline(shapes: &[Shape], idx: u32, stack: &mut Vec<u32>, budget: &mut ComponentBudget)
+    -> Option<(Outline, Vec<Vector2F>)>
+{
     if stack.contains(&idx) {
         warn!("glyf: composite glyph {} contains itself", idx);
-        return Some(Outline::new());
+        return Some((Outline::new(), Vec::new()));
     }
     if stack.len() >= MAX_COMPONENT_DEPTH {
         warn!("glyf: composite glyphs nested deeper than {}", MAX_COMPONENT_DEPTH);
-        return Some(Outline::new());
+        return Some((Outline::new(), Vec::new()));
     }
     stack.push(idx);
     let result = match shapes.get(idx as usize) {
         None => None,
-        Some(&Shape::Empty) => Some(Outline::new()),
-        Some(&Shape::Simple(ref path)) => {
-            let points: usize = path.contours().iter().map(|contour| contour.points().len()).sum();
-            if budget.take_points(points) { Some(path.clone()) } else { Some(Outline::new()) }
+        Some(&Shape::Empty) => Some((Outline::new(), Vec::new())),
+        Some(&Shape::Simple(ref path, ref points)) => {
+            let count: usize = path.contours().iter().map(|contour| contour.points().len()).sum();
+            if budget.take_points(count) {
+                Some((path.clone(), points.clone()))
+            } else {
+                Some((Outline::new(), Vec::new()))
+            }
         }
         Some(&Shape::Compound(ref parts)) => {
             let mut outline = Outline::new();
+            let mut points: Vec<Vector2F> = Vec::new();
             for part in parts {
                 if !budget.take() {
                     break;
                 }
-                let mut child = match expand_outline(shapes, part.gid, stack, budget) {
+                let (mut child, mut child_points) = match expand_outline(shapes, part.gid, stack, budget) {
                     Some(child) => child,
                     None => {
                         warn!("glyf: glyph {} references missing glyph {}", idx, part.gid);
@@ -464,16 +443,15 @@ fn expand_outline(shapes: &[Shape], idx: u32, stack: &mut Vec<u32>, budget: &mut
                 // The 2×2 part applies before the placement offset, except for a component
                 // that asks for its offset to be scaled as well.
                 child.transform(&Transform2F { matrix: part.matrix, vector: Vector2F::zero() });
+                for point in &mut child_points {
+                    *point = part.matrix * *point;
+                }
                 let offset = match part.offset {
                     ComponentOffset::Vector(v) if part.scaled_offset => part.matrix * v,
                     ComponentOffset::Vector(v) => v,
                     ComponentOffset::MatchPoints { parent, child: child_point } => {
-                        // Numbering follows the converted outline (see `spec_points`), which
-                        // differs from `glyf` for glyphs with consecutive off-curve points.
-                        debug!("glyf: glyph {} places a component by matching points {} and {}",
-                               idx, parent, child_point);
-                        match (point_at(&outline, parent), point_at(&child, child_point)) {
-                            (Some(p), Some(c)) => p - c,
+                        match (points.get(parent as usize), child_points.get(child_point as usize)) {
+                            (Some(&p), Some(&c)) => p - c,
                             _ => {
                                 warn!("glyf: glyph {} matches points {} and {} that do not exist",
                                       idx, parent, child_point);
@@ -483,9 +461,10 @@ fn expand_outline(shapes: &[Shape], idx: u32, stack: &mut Vec<u32>, budget: &mut
                     }
                 };
                 child.transform(&Transform2F::from_translation(offset));
+                points.extend(child_points.into_iter().map(|point| point + offset));
                 outline.push_outline(child);
             }
-            Some(outline)
+            Some((outline, points))
         }
     };
     stack.pop();
@@ -556,6 +535,9 @@ fn glyph_shape_positive_contours(i: &[u8], number_of_contours: usize) -> Result<
         p.1 = y_coord;
     }
 
+    let glyph_points: Vec<Vector2F> = flag_data.iter()
+        .map(|&FlagData { p, .. }| Vector2F::new(p.0 as f32, p.1 as f32))
+        .collect();
     let mut points = flag_data.iter().map(|&FlagData { flags, p }| 
         (flags & 1 != 0, Vector2F::new(p.0 as f32, p.1 as f32))
     );
@@ -570,7 +552,7 @@ fn glyph_shape_positive_contours(i: &[u8], number_of_contours: usize) -> Result<
         }
     }
     
-    Ok(Shape::Simple(outline))
+    Ok(Shape::Simple(outline, glyph_points))
 }
 
 pub fn contour(points: impl Iterator<Item=(bool, Vector2F)>) -> Option<Contour> {
@@ -660,7 +642,7 @@ mod tests {
             ].into_iter(),
         ).expect("triangle");
         outline.push_contour(contour);
-        Shape::Simple(outline)
+        Shape::Simple(outline, Vec::new())
     }
 
     /// Glyph `n` is two components of glyph `n + 1`, the last one is a plain leaf: the
@@ -681,6 +663,41 @@ mod tests {
     }
 
     #[test]
+    fn point_matching_uses_the_glyf_numbering_with_implied_points() {
+        // Audit R6: points 0..=3 are on, off, off, on. `contour()` inserts an implied midpoint
+        // between the two off-curve points, so the converted outline has more points than the
+        // glyph; point 3 of the glyph is the last one, whatever the outline holds.
+        let original = vec![
+            Vector2F::new(0., 0.), Vector2F::new(50., 100.), Vector2F::new(150., 100.), Vector2F::new(200., 0.),
+        ];
+        let mut outline = Outline::new();
+        outline.push_contour(contour(
+            original.iter().enumerate().map(|(n, &p)| (n == 0 || n == 3, p)),
+        ).expect("contour"));
+        let component = |gid, parent, child| Component {
+            gid,
+            matrix: Matrix2x2F::row_major(1., 0., 0., 1.),
+            offset: ComponentOffset::MatchPoints { parent, child },
+            scaled_offset: false,
+        };
+        let first = Component {
+            gid: 1,
+            matrix: Matrix2x2F::row_major(1., 0., 0., 1.),
+            offset: ComponentOffset::Vector(Vector2F::zero()),
+            scaled_offset: false,
+        };
+        // Place a second copy so that its point 0 lands on point 3 of the first: shift +200.
+        let shapes = vec![
+            Shape::Compound(vec![first, component(1, 3, 0)]),
+            Shape::Simple(outline, original),
+        ];
+        let result = get_outline(&shapes, 0).expect("glyph 0");
+        let max_x = result.contours().iter().flat_map(|c| c.points().iter().map(|p| p.x()))
+            .fold(0f32, f32::max);
+        assert_eq!(max_x, 400.0);
+    }
+
+    #[test]
     fn many_references_to_a_big_glyph_stop_at_the_point_budget() {
         // A composite naming one 1000-point glyph 5000 times is under the expansion cap but
         // would copy 5 million points.
@@ -696,7 +713,7 @@ mod tests {
             offset: ComponentOffset::Vector(Vector2F::zero()),
             scaled_offset: false,
         };
-        let shapes = vec![Shape::Compound(vec![component; 5000]), Shape::Simple(outline)];
+        let shapes = vec![Shape::Compound(vec![component; 5000]), Shape::Simple(outline, Vec::new())];
         let copied: usize = get_outline(&shapes, 0).expect("glyph 0").contours().iter()
             .map(|contour| contour.points().len()).sum();
         assert!(copied > 0 && copied <= MAX_COMPONENT_POINTS + 1000, "copied {} points", copied);
