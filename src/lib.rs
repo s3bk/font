@@ -43,6 +43,21 @@ pub struct GlyphPosition {
     pub y_offset: i16,
 }
 
+/// What `GSUB` knows about a glyph of a shaped run that `GPOS` needs: where a glyph came from
+/// when a ligature formed (OT §GPOS "Mark-to-Ligature Attachment" attaches a mark to the anchor
+/// of the ligature component it followed).
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlyphProps {
+    /// Non-zero for a glyph a ligature produced and for the marks it left inside itself; the
+    /// same value ties a mark to its ligature.
+    pub lig_id: u32,
+    /// For such a mark: how many components of the ligature preceded it (1 = it followed the
+    /// first). 0 for everything else.
+    pub lig_comp: u16,
+    /// For the ligature glyph itself: how many components it has.
+    pub lig_components: u16,
+}
+
 #[derive(Copy, Clone)]
 pub struct VMetrics {
     pub line_gap: f32,
@@ -157,6 +172,21 @@ pub trait Font: 'static {
     fn substitute(&self, glyphs: &[GlyphId], features: &[&[u8; 4]]) -> Vec<GlyphId> {
         let _ = features;
         glyphs.to_vec()
+    }
+
+    /// `substitute`, plus the per-glyph facts `position_props` needs (see [`GlyphProps`]): the
+    /// returned vector has one entry per output glyph.
+    fn substitute_props(&self, glyphs: &[GlyphId], features: &[&[u8; 4]]) -> (Vec<GlyphId>, Vec<GlyphProps>) {
+        let out = self.substitute(glyphs, features);
+        let props = vec![GlyphProps::default(); out.len()];
+        (out, props)
+    }
+
+    /// `position` for a run `substitute_props` produced, so that a mark attaches to the right
+    /// component of a ligature. `props` is parallel to `glyphs`.
+    fn position_props(&self, glyphs: &[GlyphId], props: &[GlyphProps], features: &[&[u8; 4]]) -> Vec<GlyphPosition> {
+        let _ = props;
+        self.position(glyphs, features)
     }
 
     /// Apply the font's `GPOS` positioning to a run of glyphs, in the font's default language

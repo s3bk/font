@@ -3,7 +3,7 @@
 use std::convert::TryInto;
 use std::collections::HashMap;
 use std::ops::Deref;
-use crate::{Font, R, IResultExt, VMetrics, HMetrics, Glyph, GlyphId, GlyphPosition, Name, FontInfo, FontType, Info, FontError, ParseResult};
+use crate::{Font, R, IResultExt, VMetrics, HMetrics, Glyph, GlyphId, GlyphPosition, GlyphProps, Name, FontInfo, FontType, Info, FontError, ParseResult};
 use crate::truetype::{Shape, parse_shapes, get_outline};
 #[cfg(feature="cff")]
 use crate::cff::read_cff;
@@ -267,12 +267,22 @@ impl Font for OpenTypeFont {
             None => glyphs.to_vec(),
         }
     }
+    fn substitute_props(&self, glyphs: &[GlyphId], features: &[&[u8; 4]]) -> (Vec<GlyphId>, Vec<GlyphProps>) {
+        match self.gsub.as_ref() {
+            Some(gsub) => gsub.substitute_with_props(glyphs, &|tag| features.iter().any(|&feature| tag.0 == *feature), self.gdef.as_ref()),
+            None => (glyphs.to_vec(), vec![GlyphProps::default(); glyphs.len()]),
+        }
+    }
     fn position(&self, glyphs: &[GlyphId], features: &[&[u8; 4]]) -> Vec<GlyphPosition> {
+        self.position_props(glyphs, &[], features)
+    }
+    fn position_props(&self, glyphs: &[GlyphId], props: &[GlyphProps], features: &[&[u8; 4]]) -> Vec<GlyphPosition> {
         match self.gpos.as_ref() {
             // Cursive and mark attachment place a glyph relative to another one, so they need
             // the advance of the base glyph to know where that one ends.
-            Some(gpos) => gpos.position_with_advances(
+            Some(gpos) => gpos.position_with_props(
                 glyphs,
+                props,
                 &|tag| features.iter().any(|&feature| tag.0 == *feature),
                 self.gdef.as_ref(),
                 &|glyph| {

@@ -4,7 +4,7 @@ use nom::{
     number::complete::{be_i16, be_u16, be_u32},
     sequence::{tuple},
 };
-use crate::{R, GlyphId, GlyphPosition, FontError};
+use crate::{R, GlyphId, GlyphPosition, GlyphProps, FontError};
 use crate::parsers::{*};
 use crate::opentype::{Maxp, Tag, parse_extension, parse_lookup_list, coverage_table, parse_class_def};
 use crate::opentype::gdef::{GDef, MarkClass, glyph_ignored, LookupFlags};
@@ -282,6 +282,21 @@ impl GPos {
         gdef: Option<&GDef>,
         advance: &dyn Fn(GlyphId) -> i16,
     ) -> Vec<GlyphPosition> {
+        self.position_with_props(glyphs, &[], enabled, gdef, advance)
+    }
+
+    /// `position_with_advances`, plus what `GSUB` recorded about each glyph (`GSub::
+    /// substitute_with_props`): which ligature a glyph is, and which component of it a mark
+    /// followed, so that mark-to-ligature attachment picks the right component's anchor.
+    /// `props` may be shorter than `glyphs` (or empty); a glyph without an entry has none.
+    pub fn position_with_props(
+        &self,
+        glyphs: &[GlyphId],
+        props: &[GlyphProps],
+        enabled: &dyn Fn(Tag) -> bool,
+        gdef: Option<&GDef>,
+        advance: &dyn Fn(GlyphId) -> i16,
+    ) -> Vec<GlyphPosition> {
         let mut out = vec![GlyphPosition::default(); glyphs.len()];
         let lookup_indices = enabled_lookups(&self.scripts, &self.features, enabled);
         if lookup_indices.is_empty() {
@@ -295,7 +310,7 @@ impl GPos {
             while position < glyphs.len() {
                 // A pair adjustment that carries a value record for the second glyph resumes
                 // after that glyph (OT §GPOS "Pair Adjustment"); anything else moves on by one.
-                position += match self.apply_lookup_at(lookup_idx, glyphs, &mut out, position, 0, gdef, advance, &mut budget) {
+                position += match self.apply_lookup_at(lookup_idx, glyphs, &mut out, position, 0, gdef, advance, props, &mut budget) {
                     Some(step) => step.max(1),
                     None => 1,
                 };
@@ -316,6 +331,7 @@ impl GPos {
         depth: u8,
         gdef: Option<&GDef>,
         advance: &dyn Fn(GlyphId) -> i16,
+        props: &[GlyphProps],
         budget: &mut OpBudget,
     ) -> Option<usize> {
         // A context rule may name the lookup it sits in, so the recursion cap alone still allows
@@ -349,9 +365,9 @@ impl GPos {
                 PosSubtable::MarkToMark(marks) =>
                     self.apply_mark_attachment(marks, glyphs, positions, position, glyph, &skip, gdef, advance, AttachTo::Mark),
                 PosSubtable::MarkToLigature(marks) =>
-                    self.apply_ligature_attachment(marks, glyphs, positions, position, glyph, &skip, gdef, advance),
+                    self.apply_ligature_attachment(marks, glyphs, positions, position, glyph, &skip, gdef, advance, props),
                 PosSubtable::Context(context) =>
-                    self.apply_context(context, glyphs, positions, position, depth, flag, gdef, advance, budget),
+                    self.apply_context(context, glyphs, positions, position, depth, flag, gdef, advance, props, budget),
             };
             if applied.is_some() {
                 return applied;
@@ -453,14 +469,21 @@ impl GPos {
         skip: &dyn Fn(u16) -> bool,
         gdef: Option<&GDef>,
         advance: &dyn Fn(GlyphId) -> i16,
+        props: &[GlyphProps],
     ) -> Option<usize> {
         let base_index = attach_index(glyphs, position, skip, gdef, AttachTo::Base)?;
         let ligature = glyph_key(*glyphs.get(base_index)?)?;
-        // The run does not record which component a mark sits over; the marks already stacked on
-        // the ligature are the components used up so far.
-        let component = (base_index + 1 .. position)
-            .filter(|&index| glyphs.get(index).and_then(|&gid| glyph_key(gid)).map_or(false, |gid| is_mark(gdef, gid)))
-            .count();
+        // Which component of the ligature the mark sits over: `GSUB` recorded, for a mark it
+        // left inside a ligature, how many components preceded it. A mark that is not part of
+        // this ligature (it came after the whole ligature) goes over the last component, as in
+        // HarfBuzz. `usize::MAX` selects the last component in `delta`.
+        let at = |index: usize| props.get(index).copied().unwrap_or_default();
+        let (base_props, mark_props) = (at(base_index), at(position));
+        let component = if mark_props.lig_id != 0 && mark_props.lig_id == base_props.lig_id && mark_props.lig_comp > 0 {
+            usize::from(mark_props.lig_comp) - 1
+        } else {
+            usize::MAX
+        };
         let (dx, dy) = marks.delta(ligature, glyph, component)?;
         place_mark(positions, position, base_index, glyphs, dx, dy, advance);
         Some(1)
@@ -470,7 +493,7 @@ impl GPos {
         /// OT §GPOS "Context Positioning" (7, 8): run the lookups the first matching rule names at
     /// the glyphs of the run. Positioning never changes the length of the run, so this consumes
     /// exactly one glyph.
-    fn apply_context(&self, context: &Context, glyphs: &[GlyphId], positions: &mut [GlyphPosition], position: usize, depth: u8, flag: LookupFlags, gdef: Option<&GDef>, advance: &dyn Fn(GlyphId) -> i16, budget: &mut OpBudget) -> Option<usize> {
+    fn apply_context(&self, context: &Context, glyphs: &[GlyphId], positions: &mut [GlyphPosition], position: usize, depth: u8, flag: LookupFlags, gdef: Option<&GDef>, advance: &dyn Fn(GlyphId) -> i16, props: &[GlyphProps], budget: &mut OpBudget) -> Option<usize> {
         if depth >= MAX_NESTING {
             debug!("GPOS: not following context lookups nested deeper than {}", MAX_NESTING);
             return None;
@@ -488,7 +511,7 @@ impl GPos {
                 None => continue,
             };
             applied |= self
-                .apply_lookup_at(lookup_index, glyphs, positions, target, depth + 1, gdef, advance, budget)
+                .apply_lookup_at(lookup_index, glyphs, positions, target, depth + 1, gdef, advance, props, budget)
                 .is_some();
         }
         if applied { Some(1) } else { None }
@@ -1410,6 +1433,30 @@ mod tests {
         // Once the `kern` feature names the lookup, the pair kerns.
         gpos.features[0] = Feature::new(b"kern", vec![0, 1]);
         assert_eq!(gpos.kerning(GlyphId(20), GlyphId(21)), Some(-40));
+    }
+
+    #[test]
+    fn a_mark_attaches_to_the_ligature_component_gsub_recorded() {
+        // Audit R5: a ligature with two components carries an anchor for each. The mark goes
+        // over the component it followed; a mark with no record goes over the last one.
+        let mut marks = HashMap::new();
+        marks.insert(12u16, (0u16, (0i16, 0i16)));
+        let mut ligatures = HashMap::new();
+        ligatures.insert(30u16, vec![vec![Some((100i16, 0i16))], vec![Some((300, 0))]]);
+        let mut gpos = GPos::default();
+        gpos.lookups = vec![vec![PosSubtable::MarkToLigature(LigatureMarks { marks, ligatures })]];
+        gpos.flags = vec![LookupFlags::default()];
+        let gpos = gpos_with(gpos, vec![0]);
+        let run = [GlyphId(30), GlyphId(12)];
+        let at = |props: &[GlyphProps]| {
+            gpos.position_with_props(&run, props, &kern_enabled, None, &|_| 0)[1].x_offset
+        };
+        let lig = GlyphProps { lig_id: 1, lig_comp: 0, lig_components: 2 };
+        let mark = |comp| GlyphProps { lig_id: 1, lig_comp: comp, lig_components: 0 };
+        assert_eq!(at(&[lig, mark(1)]), 100, "followed the first component");
+        assert_eq!(at(&[lig, mark(2)]), 300, "followed the second component");
+        assert_eq!(at(&[lig, GlyphProps::default()]), 300, "after the whole ligature");
+        assert_eq!(at(&[]), 300, "no record at all");
     }
 
     #[test]

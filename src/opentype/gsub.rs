@@ -4,7 +4,7 @@ use nom::{
     multi::count,
     sequence::tuple,
 };
-use crate::{R, GlyphId, FontError};
+use crate::{R, GlyphId, GlyphProps, FontError};
 use crate::parsers::{iterator_n, Offset};
 use crate::opentype::{parse_extension, parse_lookup_list, coverage_table, parse_class_def, tag, Tag};
 use crate::opentype::gdef::{GDef, glyph_ignored, LookupFlags};
@@ -578,13 +578,21 @@ pub(crate) const MAX_NESTING: u8 = 8;
 pub(crate) struct OpBudget {
     left: usize,
     reported: bool,
+    /// The last ligature id handed out (`GlyphProps::lig_id`); 0 means none yet.
+    lig_ids: u32,
 }
 
 impl OpBudget {
     /// Generous for real text — nested lookups are rare and shallow — while small enough that
     /// a font which tries to recurse cannot cost more than a moment.
     pub(crate) fn new(glyphs: usize) -> Self {
-        OpBudget { left: glyphs.saturating_mul(32).saturating_add(1024), reported: false }
+        OpBudget { left: glyphs.saturating_mul(32).saturating_add(1024), reported: false, lig_ids: 0 }
+    }
+
+    /// A ligature id no glyph of this run has.
+    fn fresh_lig_id(&mut self) -> u32 {
+        self.lig_ids += 1;
+        self.lig_ids
     }
 
     /// `true` if one more nested application may run, `false` once the budget is spent; the
@@ -629,13 +637,21 @@ impl GSub {
     /// `substitute`, with the `GDEF` table the font carries: it tells a lookup which glyphs to
     /// skip (OT §"Lookup Flags"), which needs the glyph classes only `GDEF` has.
     pub fn substitute_with(&self, glyphs: &[GlyphId], enabled: &dyn Fn(Tag) -> bool, gdef: Option<&GDef>) -> Vec<GlyphId> {
+        self.substitute_with_props(glyphs, enabled, gdef).0
+    }
+
+    /// `substitute_with`, plus one `GlyphProps` per output glyph: which glyphs a ligature
+    /// produced and which component each mark it skipped followed. `GPos::position_with_props`
+    /// uses them to attach marks to the right component.
+    pub fn substitute_with_props(&self, glyphs: &[GlyphId], enabled: &dyn Fn(Tag) -> bool, gdef: Option<&GDef>) -> (Vec<GlyphId>, Vec<GlyphProps>) {
         // OT §"Lookups": lookups are applied in lookup-list order.
         let lookup_indices = enabled_lookups(&self.scripts, &self.features, enabled);
         if lookup_indices.is_empty() && self.lookup.is_empty() {
-            return glyphs.to_vec();
+            return (glyphs.to_vec(), vec![GlyphProps::default(); glyphs.len()]);
         }
 
         let mut out: Vec<GlyphId> = glyphs.to_vec();
+        let mut props: Vec<GlyphProps> = vec![GlyphProps::default(); out.len()];
         // OT §"Lookup List": the lookups run in list order, and each one is applied across the
         // whole glyph run before the next starts — so a later lookup sees what the earlier
         // ones produced, and a lookup never applies to its own output (its position moves past
@@ -652,7 +668,7 @@ impl GSub {
                 // records may edit any of them, so this lookup works on the run in place.
                 let mut position = 0;
                 while position < out.len() {
-                    position += match self.apply_lookup_at(lookup_idx, &mut out, position, 0, gdef, &mut budget) {
+                    position += match self.apply_lookup_at(lookup_idx, &mut out, &mut props, position, 0, gdef, &mut budget) {
                         // A rule that produces nothing has still consumed the glyphs it matched,
                         // so the run shrank under `position`: it names the next glyph already.
                         Some(step) => step.advance.max(1),
@@ -665,21 +681,25 @@ impl GSub {
             // applies to, so this pass can append to a fresh run instead of splicing into the
             // old one — a splice moves the whole tail, which made a long run quadratic.
             let run = std::mem::replace(&mut out, Vec::new());
+            let run_props = std::mem::replace(&mut props, Vec::new());
             let mut next = Vec::with_capacity(run.len());
+            let mut next_props: Vec<GlyphProps> = Vec::with_capacity(run.len());
             let mut position = 0;
             while position < run.len() {
                 let matched = match first_glyph_of(run[position]) {
                     Some(glyph) if !glyph_ignored(gdef, flag, glyph) => subtables.iter()
-                        .find_map(|subtable| self.substitution_at(subtable, &run, position, flag, gdef)),
+                        .find_map(|subtable| self.substitution_at(subtable, &run, &run_props, position, flag, gdef, &mut budget)),
                     _ => None,
                 };
                 match matched {
-                    Some((consumed, replacement)) => {
+                    Some((consumed, replacement, replacement_props)) => {
                         next.extend(replacement);
+                        next_props.extend(replacement_props);
                         if consumed == 0 {
                             // A subtable that matched without consuming a glyph: keep the glyph
                             // and move past it rather than matching it again for ever.
                             next.push(run[position]);
+                            next_props.push(run_props[position]);
                             position += 1;
                         } else {
                             position = (position + consumed).min(run.len());
@@ -687,12 +707,15 @@ impl GSub {
                     }
                     None => {
                         next.push(run[position]);
+                        next_props.push(run_props[position]);
                         position += 1;
                     }
                 }
             }
             next.extend_from_slice(&run[position ..]);
+            next_props.extend_from_slice(&run_props[position ..]);
             out = next;
+            props = next_props;
         }
 
         // OT §GSUB "Reverse Chaining Contextual Single Substitution": that lookup type is
@@ -709,12 +732,12 @@ impl GSub {
                 }
             }
         }
-        out
+        (out, props)
     }
 
     /// Applies one lookup at `position`. `None` if no subtable of the lookup applies there.
     /// `depth` > 0 marks an application a context rule asked for; those spend `budget`.
-    fn apply_lookup_at(&self, lookup_idx: u16, glyphs: &mut Vec<GlyphId>, position: usize, depth: u8, gdef: Option<&GDef>, budget: &mut OpBudget) -> Option<Step> {
+    fn apply_lookup_at(&self, lookup_idx: u16, glyphs: &mut Vec<GlyphId>, props: &mut Vec<GlyphProps>, position: usize, depth: u8, gdef: Option<&GDef>, budget: &mut OpBudget) -> Option<Step> {
         if depth > 0 && !budget.take() {
             return None;
         }
@@ -729,14 +752,15 @@ impl GSub {
         for subtable in subtables {
             if let LookupSubtable::Context(context) = subtable {
                 // The rule names other lookups to run, so these need the whole table.
-                if let Some(step) = self.apply_context(context, glyphs, position, depth, flag, gdef, budget) {
+                if let Some(step) = self.apply_context(context, glyphs, props, position, depth, flag, gdef, budget) {
                     return Some(step);
                 }
                 continue;
             }
-            if let Some((consumed, replacement)) = self.substitution_at(subtable, glyphs, position, flag, gdef) {
+            if let Some((consumed, replacement, replacement_props)) = self.substitution_at(subtable, glyphs, props, position, flag, gdef, budget) {
                 let produced = replacement.len();
                 glyphs.splice(position .. position + consumed, replacement);
+                props.splice(position .. position + consumed, replacement_props);
                 return Some(Step { grown: produced as isize - consumed as isize, advance: produced });
             }
         }
@@ -746,29 +770,56 @@ impl GSub {
     /// One substitution subtable at `position`, as `(glyphs consumed, glyphs it produced)`.
     /// `None` for a subtable that does not apply there, and for the two that are not
     /// substitutions of a span at all (context and reverse chaining).
-    fn substitution_at(&self, subtable: &LookupSubtable, run: &[GlyphId], position: usize, flag: LookupFlags, gdef: Option<&GDef>) -> Option<(usize, Vec<GlyphId>)> {
+    fn substitution_at(&self, subtable: &LookupSubtable, run: &[GlyphId], run_props: &[GlyphProps], position: usize, flag: LookupFlags, gdef: Option<&GDef>, budget: &mut OpBudget) -> Option<(usize, Vec<GlyphId>, Vec<GlyphProps>)> {
         // OT §"Lookup Flags": ignored glyphs are invisible to the match, so a
         // ligature may skip the marks between its components.
         let skip = |gid: u16| glyph_ignored(gdef, flag, gid);
         match subtable {
             LookupSubtable::Substitution(substitution) =>
                 substitution.apply_skipping(&run[position ..], &skip).map(|(consumed, glyph)| {
-                    // The glyphs the lookup stepped over inside a ligature are not components:
-                    // they stay, after the ligature and in their order (as HarfBuzz keeps them),
-                    // instead of vanishing with the span.
+                    let props_at = |index: usize| run_props.get(index).copied().unwrap_or_default();
+                    if consumed == 1 {
+                        // One glyph for one glyph: it stays whatever it was (a ligature that a
+                        // later lookup swaps for a variant is still that ligature).
+                        return (1, vec![glyph], vec![props_at(position)]);
+                    }
+                    // A ligature. The glyphs the lookup stepped over inside it are not
+                    // components: they stay, after the ligature and in their order (as HarfBuzz
+                    // keeps them), instead of vanishing with the span. Each remembers how many
+                    // components came before it, which is what mark-to-ligature attachment needs.
+                    let lig_id = budget.fresh_lig_id();
                     let mut produced = vec![glyph];
-                    produced.extend(run[position + 1 .. position + consumed].iter().copied()
-                        .filter(|g| first_glyph_of(*g).map_or(false, |g| skip(g))));
-                    (consumed, produced)
+                    let mut produced_props = vec![GlyphProps::default()];
+                    let mut components: u16 = 1;
+                    for offset in 1 .. consumed {
+                        let g = run[position + offset];
+                        if first_glyph_of(g).map_or(false, |g| skip(g)) {
+                            produced.push(g);
+                            produced_props.push(GlyphProps { lig_id, lig_comp: components, lig_components: 0 });
+                        } else {
+                            components = components.saturating_add(1);
+                        }
+                    }
+                    produced_props[0] = GlyphProps { lig_id, lig_comp: 0, lig_components: components };
+                    (consumed, produced, produced_props)
                 }),
             LookupSubtable::Context(_) | LookupSubtable::ReverseChain(_) => None,
-            substitution => substitution.apply_with(&run[position ..], 0),
+            substitution => substitution.apply_with(&run[position ..], 0).map(|(consumed, produced)| {
+                // A one-for-one swap keeps the glyph's facts; a glyph that was split or
+                // deleted starts over.
+                let props = if consumed == 1 && produced.len() == 1 {
+                    vec![run_props.get(position).copied().unwrap_or_default()]
+                } else {
+                    vec![GlyphProps::default(); produced.len()]
+                };
+                (consumed, produced, props)
+            }),
         }
     }
 
     /// Applies the first rule of `context` that matches at `position`, which means running the
     /// lookups its records name at the glyphs of the run.
-    fn apply_context(&self, context: &Context, glyphs: &mut Vec<GlyphId>, position: usize, depth: u8, flag: LookupFlags, gdef: Option<&GDef>, budget: &mut OpBudget) -> Option<Step> {
+    fn apply_context(&self, context: &Context, glyphs: &mut Vec<GlyphId>, props: &mut Vec<GlyphProps>, position: usize, depth: u8, flag: LookupFlags, gdef: Option<&GDef>, budget: &mut OpBudget) -> Option<Step> {
         if depth >= MAX_NESTING {
             debug!("GSUB: not following context lookups nested deeper than {}", MAX_NESTING);
             return None;
@@ -791,7 +842,7 @@ impl GSub {
             if target < 0 || target as usize >= glyphs.len() {
                 continue;
             }
-            if let Some(step) = self.apply_lookup_at(lookup_index, glyphs, target as usize, depth + 1, gdef, budget) {
+            if let Some(step) = self.apply_lookup_at(lookup_index, glyphs, props, target as usize, depth + 1, gdef, budget) {
                 shift += step.grown;
             }
         }
@@ -1660,6 +1711,29 @@ mod tests {
 
         gsub.flags[0] = LookupFlags { flag: 0x0008, mark_filtering_set: None }; // IgnoreMarks
         assert_eq!(gsub.substitute_with(&run, &liga, Some(&gdef)), vec![GlyphId(30), GlyphId(12)]);
+    }
+
+    #[test]
+    fn a_ligature_records_which_component_each_skipped_mark_followed() {
+        // Audit R5: `f` mark `i` -> lig mark; the mark followed the first component, and the
+        // ligature knows it has two. A mark behind the whole ligature has no entry of its own.
+        let gdef = parse_gdef(&gdef_bytes(12, &[3, 3], &[])).expect("GDEF 1.2 parses");
+        let mut ligatures: HashMap<u16, Vec<(GlyphList, u16)>> = HashMap::new();
+        ligatures.insert(10, vec![(GlyphList(vec![20]), 30)]);
+        let mut gsub = gsub_with(
+            vec![feature(b"liga", vec![0])],
+            vec![vec![LookupSubtable::Substitution(Substitution::Ligatures(ligatures))]],
+        );
+        gsub.flags[0] = LookupFlags { flag: 0x0008, mark_filtering_set: None }; // IgnoreMarks
+        let liga = |tag: Tag| tag.0 == *b"liga";
+        let (glyphs, props) = gsub.substitute_with_props(
+            &[GlyphId(10), GlyphId(12), GlyphId(20), GlyphId(13)], &liga, Some(&gdef));
+        assert_eq!(glyphs, vec![GlyphId(30), GlyphId(12), GlyphId(13)]);
+        assert_eq!(props.len(), 3);
+        assert_ne!(props[0].lig_id, 0);
+        assert_eq!(props[0].lig_components, 2);
+        assert_eq!((props[1].lig_id, props[1].lig_comp), (props[0].lig_id, 1));
+        assert_eq!(props[2], GlyphProps::default());
     }
 
     #[test]
