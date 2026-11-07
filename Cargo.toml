@@ -24,7 +24,6 @@ pathfinder_color = { git = "https://github.com/servo/pathfinder/" }
 tuple = { git = "https://github.com/s3bk/tuple/" }
 nom = "5.1"
 log = "0.4"
-rand = { version = "0.7", features = ["wasm-bindgen"] }
 slotmap = { version = "1.0" }
 decorum = "0.3"
 itertools = "0.10"

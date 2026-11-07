@@ -311,11 +311,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                     }
                     23 => { // random (12 23) num2
                         trace!("random");
-                        use rand::{thread_rng, Rng};
-                        use rand::distributions::OpenClosed01;
-                        
-                        let val: f32 = thread_rng().sample(OpenClosed01);
-                        s.push(val);
+                        s.push(random_unit());
                         i
                     }
                     24 => { // num1 num2 mul (12 24) product
@@ -640,4 +636,32 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
     };
     
     Ok(())
+}
+
+std::thread_local! {
+    /// State for [`random_unit`], per thread: one generator is all the
+    /// `random` operator needs, and a thread-local keeps it out of the
+    /// interpreter's signature.
+    static RNG: std::cell::Cell<u32> = std::cell::Cell::new(0x9E37_79B9);
+}
+
+/// The `random` operator (12 23): a number in (0, 1].
+///
+/// This used `rand::thread_rng`, whose wasm build seeds itself from
+/// JavaScript's `crypto.getRandomValues` — which gives a wasm module that
+/// renders PDFs in a browser an import, and a viewer that imports nothing is
+/// worth more here than unpredictable noise in glyph construction. A fixed
+/// seed also makes rendering reproducible: the same document draws the same
+/// shapes on every run, which the renderer's tests rely on.
+fn random_unit() -> f32 {
+    RNG.with(|cell| {
+        let mut x = cell.get();
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        cell.set(x);
+        // The top 24 bits into (0, 1]: never 0, which is a degenerate value
+        // for the parameters this feeds.
+        ((x >> 8) + 1) as f32 / 16_777_216.0
+    })
 }
