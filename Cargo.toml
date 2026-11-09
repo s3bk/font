@@ -32,7 +32,13 @@ brotli-decompressor = { version = "2.3", optional = true }
 inflate = { version = "0.4.5", optional = true }
 svg_dom = { git = "https://github.com/s3bk/svg", optional=true }
 istring = "0.3.4"
-vello_encoding = "*"
+# Pinned: the vello encoder API this crate implements (`PathEncoder`, and the
+# `Pen` impl in `src/lib.rs`) is written against this version. A `*`
+# requirement lets a fresh resolution pick a different copy, which both breaks
+# that code and puts a second `PathEncoder` in the graph — then a downstream
+# `type Pen = PathEncoder` no longer satisfies `Pen`. `pdf_render` pins the
+# same version.
+vello_encoding = "=0.11.0"
 
 [dev-dependencies]
 svg_dom = { git = "https://github.com/s3bk/svg" }
