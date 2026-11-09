@@ -4,24 +4,38 @@
 
 use std::fmt;
 use std::convert::TryInto;
-use std::any::TypeId;
 use nom::{IResult, Err::*, error::VerboseError};
-use tuple::{TupleElements};
+use tuple::TupleElements;
 use pdf_encoding::Encoding;
 
 #[cfg(feature="svg")]
 pub use svg::SvgGlyph;
 
 use pathfinder_geometry::{rect::RectF, vector::Vector2F, transform2d::Transform2F};
-use pathfinder_content::outline::{Outline, Contour};
 
 #[derive(Clone)]
-pub struct Glyph {
+pub struct Glyph<E: Encoder> {
     /// unit 1em
     pub metrics: HMetrics,
     
     /// transform by font_matrix to scale it to 1em
-    pub path: Outline,
+    pub shape: Shape<E>,
+}
+
+#[derive(Clone)]
+pub enum Shape<E: Encoder> {
+    Simple(E::GlyphRef),
+    Compound(Vec<(GlyphId, Transform2F)>),
+    Empty
+}
+impl<E: Encoder> Shape<E> {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Shape::Empty => true,
+            Shape::Compound(v) => v.is_empty(),
+            Shape::Simple(_) => false
+        }
+    }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -74,7 +88,7 @@ pub struct Info {
     pub unicode_ranges: [u32; 4],
 }
 
-pub trait Font: 'static {
+pub trait Font<E: Encoder> {
     /// Return the "number of glyphs" in the font.
     ///
     /// This may or may not correlate to the actual number of "real glyphs".
@@ -87,7 +101,7 @@ pub trait Font: 'static {
     /// Get the glyph identified by `gid`.
     ///
     /// Note, that a *gid* is only meaningful within one font and cannot be transfered to another font.
-    fn glyph(&self, gid: GlyphId) -> Option<Glyph>;
+    fn glyph(&self, gid: GlyphId) -> Option<&Glyph<E>>;
     
     fn is_empty_glyph(&self, gid: GlyphId) -> bool;
 
@@ -177,32 +191,165 @@ pub trait Font: 'static {
     fn name(&self) -> &Name;
 
     fn info(&self) -> &Info;
+}
 
-    #[doc(hidden)]
-    // this function must return the type id of the impl
-    unsafe fn _type_id(&self) -> TypeId {
-        TypeId::of::<Self>()
+pub trait Pen {
+    fn move_to(&mut self, p: Vector2F);
+    fn line_to(&mut self, p: Vector2F);
+    fn quad_to(&mut self, p1: Vector2F, p2: Vector2F);
+    fn cubic_to(&mut self, p1: Vector2F, p2: Vector2F, p3: Vector2F);
+    fn close(&mut self);
+}
+
+pub trait Encoder {
+    type Pen<'a>: Pen;
+    type GlyphRef: Clone;
+
+    fn encode_shape<'f, O, E>(&mut self, f: impl for<'a> FnMut(&mut Self::Pen<'a>) -> Result<O, E> + 'f) -> Result<(O, Self::GlyphRef), E>;
+}
+
+
+
+#[cfg(feature="vello")]
+mod vello_impl {
+    use crate::{Encoder, Pen};
+    use vello_encoding::{Encoding, PathEncoder};
+    use pathfinder_geometry::vector::Vector2F;
+
+    impl<'a> Pen for PathEncoder<'a> {
+        fn move_to(&mut self, p: Vector2F) {
+            self.move_to(p.x(), p.y())
+        }
+    
+        fn line_to(&mut self, p: Vector2F) {
+            self.line_to(p.x(), p.y())
+        }
+    
+        fn quad_to(&mut self, p1: Vector2F, p2: Vector2F) {
+            self.quad_to(p1.x(), p1.y(), p2.x(), p2.y())
+        }
+    
+        fn cubic_to(&mut self, p1: Vector2F, p2: Vector2F, p3: Vector2F) {
+            self.cubic_to(p1.x(), p1.y(), p2.x(), p2.y(), p3.x(), p3.y())
+        }
+    
+        fn close(&mut self) {
+            self.close()
+        }
     }
 }
-impl dyn Font + Sync + Send {
-    pub fn downcast_ref<T: Font>(&self) -> Option<&T> {
-        unsafe {
-            if self._type_id() == TypeId::of::<T>() {
-                Some(&*(self as *const dyn Font as *const T))
-            } else {
-                None
+
+pub mod pathfinder_impl {
+    use pathfinder_content::outline::{Outline, Contour};
+    use pathfinder_geometry::vector::Vector2F;
+
+    use crate::Pen;
+    pub struct PathBuilder {
+        outline: Outline,
+        current_contour: Contour,
+    }
+    impl PathBuilder {
+        pub fn new() -> Self {
+            PathBuilder { outline: Outline::new(), current_contour: Contour::new() }
+        }
+        pub fn finish(mut self) -> Outline {
+            if self.current_contour.len() > 0 {
+                self.outline.push_contour(self.current_contour.clone());
             }
+            self.outline
         }
     }
-    pub fn downcast_box<T: Font>(self: Box<Self>) -> Result<Box<T>, Box<Self>> {
-        unsafe {
-            if self._type_id() == TypeId::of::<T>() {
-                let ptr = Box::into_raw(self);
-                Ok(Box::from_raw(ptr.cast()))
-            } else {
-                Err(self)
+
+    impl Pen for PathBuilder {
+        fn move_to(&mut self, p: Vector2F) {
+            if self.current_contour.len() > 0 {
+                self.outline.push_contour(self.current_contour.clone());
+                self.current_contour.clear();
             }
+            self.current_contour.push_endpoint(p);
         }
+
+        fn line_to(&mut self, p: Vector2F) {
+            self.current_contour.push_endpoint(p);
+        }
+
+        fn quad_to(&mut self, p1: Vector2F, p2: Vector2F) {
+            self.current_contour.push_quadratic(p1, p2);
+        }
+
+        fn cubic_to(&mut self, p1: Vector2F, p2: Vector2F, p3: Vector2F) {
+            self.current_contour.push_cubic(p1, p2, p3);
+        }
+
+        fn close(&mut self) {
+            self.current_contour.close();
+            self.outline.push_contour(self.current_contour.clone());
+            self.current_contour.clear();
+        }
+    }
+
+    /// The default backend: every glyph is encoded into a pathfinder [`Outline`].
+    ///
+    /// `Shape::Compound` is left composed — a glyph with components yields child ids and
+    /// transforms, and the caller walks them (see [`flatten`]).
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct OutlineEncoder;
+
+    impl crate::Encoder for OutlineEncoder {
+        type Pen<'a> = PathBuilder;
+        type GlyphRef = Outline;
+
+        fn encode_shape<'f, O, E>(
+            &mut self,
+            mut f: impl for<'a> FnMut(&'a mut Self::Pen<'a>) -> Result<O, E> + 'f,
+        ) -> Result<(O, Self::GlyphRef), E> {
+            let mut builder = PathBuilder::new();
+            let o = f(&mut builder)?;
+            Ok((o, builder.finish()))
+        }
+    }
+
+    /// Resolve one glyph of a [`crate::Font`] to a single [`Outline`], composing any
+    /// `Shape::Compound` children recursively.
+    ///
+    /// Components of a component are already flattened by the font parser, so this only has
+    /// to apply the stored transforms; it is here so a caller that only wants outlines does
+    /// not have to walk `Shape` itself.
+    pub fn flatten<F>(font: &F, id: crate::GlyphId) -> Option<Outline>
+    where
+        F: crate::Font<OutlineEncoder> + ?Sized,
+    {
+        let mut depth = 0;
+        flatten_inner(font, id, &mut depth)
+    }
+
+    fn flatten_inner<F>(font: &F, id: crate::GlyphId, depth: &mut u32) -> Option<Outline>
+    where
+        F: crate::Font<OutlineEncoder> + ?Sized,
+    {
+        use crate::Shape;
+
+        if *depth > 8 {
+            return None;
+        }
+        *depth += 1;
+        let glyph = font.glyph(id)?;
+        let out = match &glyph.shape {
+            Shape::Empty => Outline::new(),
+            Shape::Simple(outline) => outline.clone(),
+            Shape::Compound(parts) => {
+                let mut outline = Outline::new();
+                for &(child, transform) in parts {
+                    let child = flatten_inner(font, child, depth)?;
+                    for contour in child.contours() {
+                        outline.push_contour(contour.clone().transformed(&transform));
+                    }
+                }
+                outline
+            }
+        };
+        *depth -= 1;
+        Some(out)
     }
 }
 
@@ -404,10 +551,9 @@ impl<T, U> Context<T, U> where T: TryIndex, U: TryIndex {
     }
 }
 
-pub struct State {
+pub struct State<'a, P: Pen> {
     pub stack: Vec<Value>,
-    pub outline: Outline,
-    pub contour: Contour,
+    pub pen: &'a mut P,
     pub current: Vector2F,
     pub lsb: Option<f32>,
     pub char_width: Option<f32>,
@@ -452,26 +598,13 @@ pub struct Seac {
     pub accent: u8,
 }
 
-impl Seac {
-    /// The composed outline: `base` with `accent` drawn on top, the accent translated
-    /// by `(adx + sbx - asb, ady)` from the base character's origin.
-    pub fn compose(&self, mut base: Outline, accent: Outline) -> Outline {
-        let dx = self.adx + self.sbx - self.asb;
-        let accent = accent.transformed(&Transform2F::from_translation(v(dx, self.ady)));
-        for contour in accent.contours() {
-            base.push_contour(contour.clone());
-        }
-        base
-    }
-}
-
-impl State {
+impl<'a, P: Pen> State<'a, P> {
     #[inline]
-    pub fn new() -> State {
+    pub fn new(pen: &'a mut P, mut stack: Vec<Value>) -> State<P> {
+        stack.clear();
         State {
-            stack: Vec::new(),
-            outline: Outline::new(),
-            contour: Contour::new(),
+            stack,
+            pen,
             current: Vector2F::default(),
             lsb: None,
             char_width: None,
@@ -488,8 +621,6 @@ impl State {
     #[inline]
     pub fn clear(&mut self) {
         self.stack.clear();
-        self.outline.clear();
-        self.contour.clear();
         self.current = Vector2F::default();
         self.lsb = None;
         self.char_width = None;
@@ -503,25 +634,6 @@ impl State {
         self.seac = None;
     }
 
-    #[inline]
-    fn flush(&mut self) {
-        if !self.contour.is_empty() {
-            self.contour.close();
-            self.outline.push_contour(self.contour.clone());
-            self.contour.clear();
-        }
-    }
-    #[inline]
-    pub fn into_path(mut self) -> Outline {
-        self.flush();
-        self.outline
-    }
-    #[inline]
-    pub fn take_path(&mut self) -> Outline {
-        self.flush();
-        let outline = self.outline.clone();
-        outline
-    }
     #[inline]
     pub fn push(&mut self, v: impl Into<Value>) {
         self.stack.push(v.into());
@@ -593,35 +705,162 @@ pub fn font_type(data: &[u8]) -> Option<FontType> {
     Some(t)
 }
 
-pub fn parse(data: &[u8]) -> Result<Box<dyn Font + Send + Sync + 'static>, FontError> {
+pub enum FontVariant<E: Encoder> {
+    #[cfg(feature="opentype")]
+    OpenType(OpenTypeFont<E>),
+    #[cfg(feature="opentype")]
+    TrueType(TrueTypeFont<E>),
+    #[cfg(feature="type1")]
+    Type1(Type1Font<E>),
+    #[cfg(feature="cff")]
+    Cff(CffFont<E>),
+}
+
+macro_rules! impl_variants {
+    ($(#[$meta:meta] $name:ident ($inner:ty),)*) => {
+        impl<E: Encoder + 'static> Font<E> for FontVariant<E> {
+            fn num_glyphs(&self) -> u32 {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.num_glyphs(), 
+                )* }
+            }
+        
+            fn font_matrix(&self) -> Transform2F {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.font_matrix(), 
+                )* }
+            }
+        
+            fn glyph(&self, gid: GlyphId) -> Option<&Glyph<E>> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.glyph(gid), 
+                )* }
+            }
+        
+            fn is_empty_glyph(&self, gid: GlyphId) -> bool {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.is_empty_glyph(gid), 
+                )* }
+            }
+
+            #[cfg(feature="svg")]
+            fn svg_glyph(&self, gid: GlyphId) -> Option<&SvgGlyph> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.svg_glyph(gid), 
+                )* }
+            }
+
+            fn gid_for_codepoint(&self, codepoint: u32) -> Option<GlyphId> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.gid_for_codepoint(codepoint), 
+                )* }
+            }
+
+            fn gid_for_name(&self, name: &str) -> Option<GlyphId> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.gid_for_name(name), 
+                )* }
+            }
+            fn gid_for_unicode_codepoint(&self, codepoint: u32) -> Option<GlyphId> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.gid_for_unicode_codepoint(codepoint), 
+                )* }
+            }
+            fn encoding(&self) -> Option<Encoding> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.encoding(), 
+                )* }
+            }
+            fn get_notdef_gid(&self) -> GlyphId {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.get_notdef_gid(), 
+                )* }
+            }
+            fn bbox(&self) -> Option<RectF> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.bbox(), 
+                )* }
+            }
+            fn vmetrics(&self) -> Option<VMetrics> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.vmetrics(), 
+                )* }
+            }
+            fn kerning(&self, left: GlyphId, right: GlyphId) -> f32 {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.kerning(left, right), 
+                )* }
+            }
+        
+            fn name(&self) -> &Name {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.name(), 
+                )* }
+            }
+        
+            fn info(&self) -> &Info {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.info(), 
+                )* }
+            }
+        }
+    };
+}
+impl_variants!{
+    #[cfg(feature="opentype")]
+    OpenType(OpenTypeFont<E>),
+    #[cfg(feature="opentype")]
+    TrueType(TrueTypeFont<E>),
+    #[cfg(feature="type1")]
+    Type1(Type1Font<E>),
+    #[cfg(feature="cff")]
+    Cff(CffFont<E>),
+}
+
+pub fn parse<E: Encoder>(data: &[u8], encoder: &mut E) -> Result<FontVariant<E>, FontError> {
     let magic: &[u8; 4] = slice!(data, 0 .. 4).try_into().unwrap();
     info!("font magic: {:?} ({:?})", magic, String::from_utf8_lossy(&*magic));
     Ok(match magic {
         #[cfg(feature="type1")]
-        &[0x80, 1, _, _] => Box::new(t!(Type1Font::parse_pfb(data))) as _,
+        &[0x80, 1, _, _] => FontVariant::Type1(t!(Type1Font::parse_pfb(data, encoder))),
         
         #[cfg(feature="opentype")]
-        b"OTTO" | [0,1,0,0] => Box::new(t!(OpenTypeFont::parse(data))) as _,
+        b"OTTO" | [0,1,0,0] => FontVariant::OpenType(t!(OpenTypeFont::parse(data, encoder))),
         
         b"ttcf" | b"typ1" => error!("FontCollections not implemented"), // Box::new(TrueTypeFont::parse(data, 0)) as _,
         
         #[cfg(feature="opentype")]
-        b"true" => Box::new(t!(TrueTypeFont::parse(data))) as _,
+        b"true" => FontVariant::TrueType(t!(TrueTypeFont::parse(data, encoder))),
         
         #[cfg(feature="type1")]
-        b"%!PS" => Box::new(t!(Type1Font::parse_postscript(data))) as _,
+        b"%!PS" => FontVariant::Type1(t!(Type1Font::parse_postscript(data, encoder))),
 
         #[cfg(feature="woff")]
-        b"wOFF" => Box::new(t!(woff::parse_woff(data))) as _,
+        b"wOFF" => FontVariant::OpenType(t!(woff::parse_woff(data, encoder))),
 
         #[cfg(feature="woff")]
-        b"wOF2" => Box::new(t!(woff::parse_woff2(data))) as _,
+        b"wOF2" => FontVariant::OpenType(t!(woff::parse_woff2(data, encoder))),
 
         #[cfg(feature="cff")]
-        &[1, _, _, _] => Box::new(t!(CffFont::parse(data, 0))) as _,
+        &[1, _, _, _] => FontVariant::Cff(t!(CffFont::parse(data, 0, encoder))),
         
         #[cfg(feature="type1")]
-        &[37, 33, _, _] => Box::new(t!(Type1Font::parse_pfa(data))) as _,
+        &[37, 33, _, _] => FontVariant::Type1(t!(Type1Font::parse_pfa(data, encoder))),
 
         magic => return Err(FontError::UnknownMagic(*magic))
     })
@@ -640,7 +879,7 @@ pub fn font_info(data: &[u8]) -> Option<FontInfo> {
     info!("font magic: {:?} ({:?})", magic, String::from_utf8_lossy(&*magic));
     match magic {
         #[cfg(feature="opentype")]
-        b"OTTO" | [0,1,0,0] => OpenTypeFont::info(data).ok(),
+        b"OTTO" | [0,1,0,0] => opentype::info(data).ok(),
         _ => None
     }
 }

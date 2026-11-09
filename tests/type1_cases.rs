@@ -6,7 +6,11 @@
 //! cipher of `eexec::Decoder::charstring`, r = 4330).
 #![cfg(feature = "type1")]
 
-use font::{Font, GlyphId};
+mod common;
+
+use common::{outline, Outline, OutlineEncoder};
+
+use font::{Font, FontVariant, GlyphId};
 
 // ---------------------------- charstring encryption
 
@@ -161,8 +165,8 @@ fn glyph_a() -> Vec<u8> {
     cs
 }
 
-fn parse(data: &[u8]) -> Box<dyn Font + Send + Sync + 'static> {
-    font::parse(data).expect("Type 1 font parses")
+fn parse(data: &[u8]) -> FontVariant<OutlineEncoder> {
+    font::parse(data, &mut OutlineEncoder).expect("Type 1 font parses")
 }
 
 // ---------------------------- tests
@@ -233,7 +237,7 @@ fn c22_pfb_unknown_block_type_is_an_error() {
         0x80, 1, 0, 0, 0, 0, // an empty ASCII block
         0x80, 7, 0, 0, 0, 0, // block type 7 does not exist
     ];
-    assert!(font::parse(&data).is_err());
+    assert!(font::parse(&data, &mut OutlineEncoder).is_err());
 }
 
 // ---------------------------- seac
@@ -360,10 +364,9 @@ fn c24_type1_flex_draws_two_cubics() {
     );
     let font = parse(&data);
     let gid = font.gid_for_name("flex").expect("glyph flex");
-    let glyph = font.glyph(gid).unwrap();
-
-    assert_eq!(glyph.metrics.advance, 500.0);
-    let contours = glyph.path.contours();
+    assert_eq!(font.glyph(gid).unwrap().metrics.advance, 500.0);
+    let glyph = outline(&font, gid);
+    let contours = glyph.contours();
     assert_eq!(contours.len(), 1);
     let points = contours[0].points();
     // start of the flex, then the two cubics: 1 + 3 + 3
@@ -401,19 +404,16 @@ fn c23_type1_seac_composes_the_accent() {
     let acute = font.gid_for_name("acute").expect("glyph acute");
     let aacute = font.gid_for_name("Aacute").expect("glyph Aacute");
 
-    let base = font.glyph(a).unwrap().path;
-    let accent = font.glyph(acute).unwrap().path;
-    let composed = font.glyph(aacute).unwrap();
+    let base = outline(&font, a);
+    let accent = outline(&font, acute);
+    let composed = outline(&font, aacute);
 
     // The composite keeps its own width …
-    assert_eq!(composed.metrics.advance, 500.0);
+    assert_eq!(font.glyph(aacute).unwrap().metrics.advance, 500.0);
     // … and carries both parts: bchar 65 = /A, achar 194 = /acute (StandardEncoding).
-    assert_eq!(
-        composed.path.contours().len(),
-        base.contours().len() + accent.contours().len()
-    );
+    assert_eq!(composed.contours().len(), base.contours().len() + accent.contours().len());
     // The accent sits at (adx, ady) from the base origin.
-    let shifted = &composed.path.contours()[base.contours().len()];
+    let shifted = &composed.contours()[base.contours().len()];
     let original = accent.contours()[0].points();
     assert_eq!(shifted.points().len(), original.len());
     for (s, o) in shifted.points().iter().zip(original) {
@@ -421,7 +421,7 @@ fn c23_type1_seac_composes_the_accent() {
         assert_eq!(s.y(), o.y() + 200.0);
     }
     // The base is not moved.
-    let base_after = composed.path.contours()[0].points();
+    let base_after = composed.contours()[0].points();
     for (s, o) in base_after.iter().zip(base.contours()[0].points()) {
         assert_eq!(s, o);
     }
@@ -445,12 +445,12 @@ fn c23b_type1_seac_honours_the_side_bearings() {
         Some("{/.notdef /A /acute /Aacute}"),
     );
     let font = parse(&data);
-    let base = font.glyph(font.gid_for_name("A").expect("glyph A")).unwrap().path;
-    let accent = font.glyph(font.gid_for_name("acute").expect("glyph acute")).unwrap().path;
-    let composed = font.glyph(font.gid_for_name("Aacute").expect("glyph Aacute")).unwrap();
+    let base = outline(&font, font.gid_for_name("A").expect("glyph A"));
+    let accent = outline(&font, font.gid_for_name("acute").expect("glyph acute"));
+    let composed = outline(&font, font.gid_for_name("Aacute").expect("glyph Aacute"));
 
-    assert_eq!(composed.path.contours().len(), base.contours().len() + accent.contours().len());
-    let shifted = &composed.path.contours()[base.contours().len()];
+    assert_eq!(composed.contours().len(), base.contours().len() + accent.contours().len());
+    let shifted = &composed.contours()[base.contours().len()];
     let original = accent.contours()[0].points();
     assert_eq!(shifted.points().len(), original.len());
     for (s, o) in shifted.points().iter().zip(original) {
@@ -458,7 +458,7 @@ fn c23b_type1_seac_honours_the_side_bearings() {
         assert_eq!(s.y(), o.y() + 200.0);
     }
     // the base stays where it was
-    for (s, o) in composed.path.contours()[0].points().iter().zip(base.contours()[0].points()) {
+    for (s, o) in composed.contours()[0].points().iter().zip(base.contours()[0].points()) {
         assert_eq!(s, o);
     }
 }
@@ -480,12 +480,13 @@ fn c25_type1_leniv_minus_one_is_plaintext() {
     // `/Encoding` is positional: array entry 1 is `/A`, so code 1 reaches it.
     assert_eq!(font.gid_for_codepoint(1), Some(a));
 
-    let glyph = font.glyph(a).unwrap();
-    assert_eq!(glyph.metrics.advance, 500.0);
-    assert_eq!(glyph.metrics.lsb, 0.0);
+    let metrics = font.glyph(a).unwrap().metrics;
+    assert_eq!(metrics.advance, 500.0);
+    assert_eq!(metrics.lsb, 0.0);
     // `100 100 rlineto` after `hsbw`: one contour whose only recorded point is the
     // rlineto endpoint (the starting point at the origin is implicit).
-    let contours = glyph.path.contours();
+    let contours = outline(&font, a);
+    let contours = contours.contours();
     assert_eq!(contours.len(), 1);
     let points = contours[0].points();
     assert_eq!(points.len(), 1, "{:?}", points);

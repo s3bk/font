@@ -5,8 +5,8 @@ use std::io::{Read, Cursor};
 use brotli_decompressor::{Decompressor};
 
 use crate::{
-    R, IResultExt, FontError, ParseResult,
-    truetype::{Shape, contour, compound, parse_shapes},
+    R, IResultExt, Encoder, FontError, Glyph, ParseResult,
+    truetype::{GlyfShape, contour, compound, encode_shape, parse_shapes},
     parsers::{iterator, varint_u32, varint_u16, parse, count_map},
     opentype::{Tables, parse_head, parse_hhea, parse_maxp, parse_hmtx, parse_hmtx_woff2_format1, parse_loca, OpenTypeFont},
 };
@@ -30,7 +30,7 @@ const MAX_TABLE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SFNT_BYTES: usize = 256 * 1024 * 1024;
 
 
-pub fn parse_woff(data: &[u8]) -> Result<OpenTypeFont, FontError> {
+pub fn parse_woff<E: Encoder>(data: &[u8], encoder: &mut E) -> Result<OpenTypeFont<E>, FontError> {
     let (i, _) = tag(b"wOFF")(data)?;
     let (i, flavor) = take(4usize)(i)?;
     let (i, length) = be_u32(i)?;
@@ -104,7 +104,7 @@ pub fn parse_woff(data: &[u8]) -> Result<OpenTypeFont, FontError> {
     }
     
     let tables = Tables { entries: tables };
-    OpenTypeFont::from_tables(tables)
+    OpenTypeFont::from_tables(tables, encoder)
 }
 
 #[derive(Debug)]
@@ -126,7 +126,7 @@ fn woff_dir_entry(i: &[u8]) -> R<WoffDirEntry> {
     }))
 }
     
-pub fn parse_woff2(i: &[u8]) -> Result<OpenTypeFont, FontError> {
+pub fn parse_woff2<E: Encoder>(i: &[u8], encoder: &mut E) -> Result<OpenTypeFont<E>, FontError> {
     let (i, _) = tag(b"wOF2")(i)?;
     let (i, flavor) = take(4usize)(i)?;
     let (i, _length) = be_u32(i)?;
@@ -192,22 +192,32 @@ pub fn parse_woff2(i: &[u8]) -> Result<OpenTypeFont, FontError> {
     }).transpose()?;
     
     let glyf = tables.get(b"glyf").map(|glyf_data| {
-        match entry_tables[b"glyf"].flags {
-            0 => parse_glyf_t0(&glyf_data),
+        let shapes: Vec<GlyfShape> = match entry_tables[b"glyf"].flags {
+            0 => parse_glyf_t0(&glyf_data)?,
             3 => {
                 let head = parse_head(expect!(tables.get(b"head"), "no head"))?;
                 let maxp = parse_maxp(expect!(tables.get(b"maxp"), "no maxp"))?;
                 let loca = parse_loca(expect!(tables.get(b"loca"), "no loca"), &head, &maxp)?;
-                parse_shapes(&loca, glyf_data)
+                parse_shapes(&loca, glyf_data)?
             }
             f => error!("invalid flag for glyf: {}", f)
+        };
+        // Same as a plain `glyf` table: the parse works on outlines, then every glyph goes
+        // through the encoder once.
+        let mut glyphs = Vec::with_capacity(shapes.len());
+        for (i, shape) in shapes.iter().enumerate() {
+            glyphs.push(Glyph {
+                metrics: hmtx.as_ref().and_then(|h| h.metrics_for_gid(i as u16)).unwrap_or_default(),
+                shape: encode_shape(shape, &shapes, i as u32, encoder)?,
+            });
         }
+        Ok(glyphs)
     }).transpose()?;
 
-    OpenTypeFont::from_hmtx_glyf_and_tables(hmtx, glyf, tables)
+    OpenTypeFont::from_hmtx_glyf_and_tables(hmtx, glyf, tables, encoder)
 }
 
-fn parse_glyf_t0(i: &[u8]) -> Result<Vec<Shape>, FontError> {
+fn parse_glyf_t0(i: &[u8]) -> Result<Vec<GlyfShape>, FontError> {
     let (i, _) = tag([0u8; 4])(i)?;
     let (i, num_glyphs) = be_u16(i)?;
     let (i, _index_format) = be_u16(i)?;
@@ -238,7 +248,7 @@ fn parse_glyf_t0(i: &[u8]) -> Result<Vec<Shape>, FontError> {
     
     for n_contour in contours {
         match n_contour {
-            0 => glyphs.push(Shape::Empty),
+            0 => glyphs.push(GlyfShape::Empty),
             -1 => glyphs.push(parse(&mut composite_stream, compound)?),
             n if n > 0 => {
                 let mut outline = Outline::new();
@@ -283,7 +293,7 @@ fn parse_glyf_t0(i: &[u8]) -> Result<Vec<Shape>, FontError> {
                         outline.push_contour(contour);
                     }
                 }
-                glyphs.push(Shape::Simple(outline));
+                glyphs.push(GlyfShape::Simple(outline));
                 let _num_instructions = parse(&mut glyph_stream, varint_u16)?;
             }
             n => error!("invalid number of contours: {}", n)

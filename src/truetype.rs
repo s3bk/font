@@ -1,8 +1,12 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::iter;
 use std::ops::Deref;
 use crate::opentype::post::parse_post;
-use crate::{Font, Glyph, R, IResultExt, GlyphId, Name, Info, VMetrics, FontError};
+use crate::{
+    Encoder, Font, FontError, Glyph, GlyphId, HMetrics, IResultExt, Info, Name, Pen, R, Shape,
+    VMetrics,
+};
 use crate::parsers::{iterator, parse};
 use pdf_encoding::Encoding;
 use nom::{
@@ -10,7 +14,8 @@ use nom::{
     bytes::complete::take,
     sequence::tuple
 };
-use pathfinder_content::outline::{Outline, Contour};
+use pathfinder_content::outline::{Outline, Contour, ContourIterFlags};
+use pathfinder_content::segment::SegmentKind;
 use pathfinder_geometry::{vector::Vector2F, transform2d::Transform2F, rect::RectF};
 use crate::opentype::{
     parse_tables, parse_head, parse_maxp, parse_loca,
@@ -48,16 +53,21 @@ pub struct Component {
     pub scaled_offset: bool,
 }
 
+/// What a `glyf` record says about one glyph, before it is handed to the encoder.
+///
+/// This is the parse representation and it keeps outlines: a composite placed by point matching
+/// needs the points of the components placed before it, which the encoder's own `Shape<E>`
+/// cannot give back. `Shape<E>` is what the font finally exposes.
 #[derive(Clone)]
-pub enum Shape {
+pub enum GlyfShape {
     Simple(Outline),
     Compound(Vec<Component>),
     Empty
 }
 
 #[derive(Clone)]
-pub struct TrueTypeFont {
-    shapes: Vec<Shape>,
+pub struct TrueTypeFont<E: Encoder> {
+    glyphs: Vec<Glyph<E>>,
     pub cmap: Option<CMap>,
     encoding: Option<Encoding>,
     hmtx: Hmtx,
@@ -71,12 +81,12 @@ pub struct TrueTypeFont {
     pub name_map: HashMap<String, u16>,
 }
 
-impl TrueTypeFont {
-    pub fn parse(data: &[u8]) -> Result<Self, FontError> {
+impl<E: Encoder> TrueTypeFont<E> {
+    pub fn parse(data: &[u8], encoder: &mut E) -> Result<Self, FontError> {
         let tables = parse_tables(data)?;
-        TrueTypeFont::parse_glyf(tables)
+        TrueTypeFont::parse_glyf(tables, encoder)
     }
-    pub fn parse_glyf(tables: Tables<impl Deref<Target=[u8]>>) -> Result<Self, FontError> {
+    pub fn parse_glyf(tables: Tables<impl Deref<Target=[u8]>>, encoder: &mut E) -> Result<Self, FontError> {
         let head = parse_head(expect!(tables.get(b"head"), "no head"))?;
         let maxp = parse_maxp(expect!(tables.get(b"maxp"), "no maxp"))?;
         let loca = parse_loca(expect!(tables.get(b"loca"), "no loca"), &head, &maxp)?;
@@ -84,17 +94,17 @@ impl TrueTypeFont {
         let hhea = parse_hhea(expect!(tables.get(b"hhea"), "no hhea"))?;
         let hmtx = parse_hmtx(expect!(tables.get(b"hmtx"), "no hmtx"), &hhea, &maxp)?;
         
-        let shapes = parse_shapes(&loca, glyf)?;
+        let glyphs = parse_glyphs(&loca, glyf, &hmtx, encoder)?;
         
-        TrueTypeFont::from_shapes_and_metrics(tables, shapes, hmtx)
+        TrueTypeFont::from_shapes_and_metrics(tables, glyphs, hmtx)
     }
-    pub fn from_shapes_and_metrics(tables: Tables<impl Deref<Target=[u8]>>, shapes: Vec<Shape>, hmtx: Hmtx) -> Result<TrueTypeFont, FontError> {
+    pub fn from_shapes_and_metrics(tables: Tables<impl Deref<Target=[u8]>>, glyphs: Vec<Glyph<E>>, hmtx: Hmtx) -> Result<TrueTypeFont<E>, FontError> {
         let head = parse_head(expect!(tables.get(b"head"), "no head"))?;
         // OT §maxp: this is the authoritative glyph count; `loca` and `post` have to agree
-        // with it, and it must not silently differ from what the shapes contain.
+        // with it, and it must not silently differ from what the glyphs contain.
         let maxp = parse_maxp(expect!(tables.get(b"maxp"), "no maxp"))?;
-        if shapes.len() != maxp.num_glyphs as usize {
-            warn!("glyf/loca describe {} glyphs, maxp says {}", shapes.len(), maxp.num_glyphs);
+        if glyphs.len() != maxp.num_glyphs as usize {
+            warn!("glyf/loca describe {} glyphs, maxp says {}", glyphs.len(), maxp.num_glyphs);
         }
         let (cmap, encoding) = match tables.get(b"cmap").map(|data| parse_cmap(data)).transpose()? {
             Some((cmap, encoding)) => (Some(cmap), Some(encoding)),
@@ -115,7 +125,7 @@ impl TrueTypeFont {
         }
         
         Ok(TrueTypeFont {
-            shapes,
+            glyphs,
             cmap,
             encoding,
             hmtx,
@@ -134,11 +144,9 @@ impl TrueTypeFont {
             name_map,
         })
     }
-    fn get_path(&self, idx: u32) -> Option<Outline> {
-        get_outline(&self.shapes, idx)
-    }
 }
-impl Font for TrueTypeFont {
+
+impl<E: Encoder + 'static> Font<E> for TrueTypeFont<E> {
     fn num_glyphs(&self) -> u32 {
         // OT §maxp, not `shapes.len()`: both `OpenTypeFont` and `TrueTypeFont` must answer
         // the same number for the same font.
@@ -148,28 +156,14 @@ impl Font for TrueTypeFont {
         let scale = 1.0 / self.units_per_em as f32;
         Transform2F::from_scale(Vector2F::splat(scale.into()))
     }
-    fn glyph(&self, id: GlyphId) -> Option<Glyph> {
-        if id.0 > u16::max_value() as u32 {
-            return None;
-        }
-        
-        debug!("get gid {:?}", id);
-        let path = self.get_path(id.0)?;
-        let metrics = self.hmtx.metrics_for_gid(id.0 as u16)?;
-        
-        Some(Glyph {
-            path,
-            metrics
-        })
+    fn glyph(&self, id: GlyphId) -> Option<&Glyph<E>> {
+        self.glyphs.get(id.0 as usize)
     }
     fn is_empty_glyph(&self, gid: GlyphId) -> bool {
-        if gid.0 > u16::max_value() as u32 {
-            return true;
-        }
-        match self.shapes.get(gid.0 as usize) {
+        match self.glyphs.get(gid.0 as usize) {
             None => true,
-            Some(Shape::Empty) => true,
-            _ => false
+            Some(Glyph { shape: Shape::Empty, .. }) => true,
+            Some(Glyph { shape, .. }) => shape.is_empty(),
         }
     }
     fn gid_for_codepoint(&self, codepoint: u32) -> Option<GlyphId> {
@@ -223,7 +217,7 @@ fn fraction_i16(i: &[u8]) -> R<f32> {
     Ok((i, s as f32 / 16384.0))
 }
 
-pub fn parse_shapes(loca: &[u32], data: &[u8]) -> Result<Vec<Shape>, FontError> {
+pub fn parse_shapes(loca: &[u32], data: &[u8]) -> Result<Vec<GlyfShape>, FontError> {
     // OT §loca: the last offset is the length of `glyf`; anything larger points outside it.
     // Only the glyphs past the end are affected and they are read as empty below, so a font
     // that overshoots still renders the rest.
@@ -242,12 +236,12 @@ pub fn parse_shapes(loca: &[u32], data: &[u8]) -> Result<Vec<Shape>, FontError> 
                 Ok(shape) => shape,
                 Err(e) => {
                     warn!("glyph {}: {:?} — treated as an empty glyph", i, e);
-                    Shape::Empty
+                    GlyfShape::Empty
                 }
             },
             None => {
                 warn!("glyph {}: loca range {}..{} outside glyf — treated as an empty glyph", i, start, end);
-                Shape::Empty
+                GlyfShape::Empty
             }
         };
         shapes.push(shape);
@@ -256,23 +250,23 @@ pub fn parse_shapes(loca: &[u32], data: &[u8]) -> Result<Vec<Shape>, FontError> 
 }
 // the following code is borrowed from stb-truetype and modified heavily
 
-fn parse_glyph_shape(data: &[u8]) -> Result<Shape, FontError> {
+fn parse_glyph_shape(data: &[u8]) -> Result<GlyfShape, FontError> {
     if data.len() == 0 {
-        return Ok(Shape::Empty);
+        return Ok(GlyfShape::Empty);
     }
     let (i, number_of_contours) = be_i16(data)?;
     
     let (i, _) = take(8usize)(i)?;
     //debug!("n_contours: {}", number_of_contours);
     match number_of_contours {
-        0 => Ok(Shape::Empty),
+        0 => Ok(GlyfShape::Empty),
         n if n >= 0 => glyph_shape_positive_contours(i, number_of_contours as usize),
         -1 => compound(i).get(),
         n => error!("Contour format {} not supported.", n)
     }
 }
 
-pub fn compound(mut input: &[u8]) -> R<Shape> {
+pub fn compound(mut input: &[u8]) -> R<GlyfShape> {
     // Compound shapes
     let mut parts = Vec::new();
     loop {
@@ -322,7 +316,7 @@ pub fn compound(mut input: &[u8]) -> R<Shape> {
             break;
         }
     }
-    Ok((input, Shape::Compound(parts)))
+    Ok((input, GlyfShape::Compound(parts)))
 }
 
 /// The points of a contour without the closing point that `contour()` appends, i.e. the
@@ -348,15 +342,17 @@ fn spec_points(contour: &Contour) -> &[Vector2F] {
     }
 }
 
-/// Point `index` of an outline, counting continuously over its contours (§glyf point numbers).
-fn point_at(outline: &Outline, index: u16) -> Option<Vector2F> {
+/// The contours of a glyph as point lists, for point matching (§glyf point numbers).
+type PointContours = Vec<Vec<Vector2F>>;
+
+/// Point `index` of those contours, counting continuously over them.
+fn point_at(contours: &[Vec<Vector2F>], index: u16) -> Option<Vector2F> {
     let mut n = index as usize;
-    for contour in outline.contours() {
-        let points = spec_points(contour);
-        if n < points.len() {
-            return Some(points[n]);
+    for contour in contours {
+        if n < contour.len() {
+            return Some(contour[n]);
         }
-        n -= points.len();
+        n -= contour.len();
     }
     None
 }
@@ -426,70 +422,158 @@ impl ComponentBudget {
     }
 }
 
-pub fn get_outline(shapes: &[Shape], idx: u32) -> Option<Outline> {
-    let mut budget = ComponentBudget::new();
-    expand_outline(shapes, idx, &mut Vec::new(), &mut budget)
-}
-
-fn expand_outline(shapes: &[Shape], idx: u32, stack: &mut Vec<u32>, budget: &mut ComponentBudget) -> Option<Outline> {
+/// Flattens the composite glyph `idx` into the simple glyphs it draws, each with the transform
+/// that places it in `idx`'s own coordinate space.
+///
+/// A composite may name another composite, and a backend is only promised simple glyphs inside a
+/// `Shape::Compound` (see `pdf_render`'s `draw_glyph`), so nesting is resolved here rather than
+/// left to the backend. Point matching (§glyf, `ARGS_ARE_XY_VALUES` clear) also needs the points
+/// of the components placed before it, which is what the second half of the return value carries.
+fn expand_components(shapes: &[GlyfShape], idx: u32, stack: &mut Vec<u32>, budget: &mut ComponentBudget)
+    -> (Vec<(u32, Transform2F)>, PointContours)
+{
     if stack.contains(&idx) {
         warn!("glyf: composite glyph {} contains itself", idx);
-        return Some(Outline::new());
+        return (Vec::new(), PointContours::new());
     }
     if stack.len() >= MAX_COMPONENT_DEPTH {
         warn!("glyf: composite glyphs nested deeper than {}", MAX_COMPONENT_DEPTH);
-        return Some(Outline::new());
+        return (Vec::new(), PointContours::new());
     }
     stack.push(idx);
-    let result = match shapes.get(idx as usize) {
-        None => None,
-        Some(&Shape::Empty) => Some(Outline::new()),
-        Some(&Shape::Simple(ref path)) => {
-            let points: usize = path.contours().iter().map(|contour| contour.points().len()).sum();
-            if budget.take_points(points) { Some(path.clone()) } else { Some(Outline::new()) }
+    let mut out = Vec::new();
+    let mut points = PointContours::new();
+    match shapes.get(idx as usize) {
+        None => warn!("glyf: missing glyph {}", idx),
+        Some(GlyfShape::Empty) => {}
+        Some(GlyfShape::Simple(path)) => {
+            let count: usize = path.contours().iter().map(|contour| contour.points().len()).sum();
+            if budget.take_points(count) {
+                out.push((idx, Transform2F::default()));
+                points.extend(path.contours().iter().map(|contour| spec_points(contour).to_vec()));
+            }
         }
-        Some(&Shape::Compound(ref parts)) => {
-            let mut outline = Outline::new();
-            for part in parts {
-                if !budget.take() {
-                    break;
+        Some(GlyfShape::Compound(parts)) => for part in parts {
+            if !budget.take() {
+                break;
+            }
+            // the component in the composite's own space, before its offset is known
+            let (children, mut contours) = expand_components(shapes, part.gid, stack, budget);
+            let matrix = Transform2F { matrix: part.matrix, vector: Vector2F::zero() };
+            for contour in contours.iter_mut() {
+                for point in contour.iter_mut() {
+                    *point = matrix * *point;
                 }
-                let mut child = match expand_outline(shapes, part.gid, stack, budget) {
-                    Some(child) => child,
-                    None => {
-                        warn!("glyf: glyph {} references missing glyph {}", idx, part.gid);
-                        continue;
-                    }
-                };
-                // The 2×2 part applies before the placement offset, except for a component
-                // that asks for its offset to be scaled as well.
-                child.transform(&Transform2F { matrix: part.matrix, vector: Vector2F::zero() });
-                let offset = match part.offset {
-                    ComponentOffset::Vector(v) if part.scaled_offset => part.matrix * v,
-                    ComponentOffset::Vector(v) => v,
-                    ComponentOffset::MatchPoints { parent, child: child_point } => {
-                        // Numbering follows the converted outline (see `spec_points`), which
-                        // differs from `glyf` for glyphs with consecutive off-curve points.
-                        debug!("glyf: glyph {} places a component by matching points {} and {}",
-                               idx, parent, child_point);
-                        match (point_at(&outline, parent), point_at(&child, child_point)) {
-                            (Some(p), Some(c)) => p - c,
-                            _ => {
-                                warn!("glyf: glyph {} matches points {} and {} that do not exist",
-                                      idx, parent, child_point);
-                                Vector2F::zero()
-                            }
+            }
+            let offset = match part.offset {
+                ComponentOffset::Vector(v) if part.scaled_offset => part.matrix * v,
+                ComponentOffset::Vector(v) => v,
+                ComponentOffset::MatchPoints { parent, child: child_point } => {
+                    // Numbering follows the converted outline (see `spec_points`), which differs
+                    // from `glyf` for glyphs with consecutive off-curve points.
+                    debug!("glyf: glyph {} places a component by matching points {} and {}",
+                           idx, parent, child_point);
+                    match (point_at(&points, parent), point_at(&contours, child_point)) {
+                        (Some(p), Some(c)) => p - c,
+                        _ => {
+                            warn!("glyf: glyph {} matches points {} and {} that do not exist",
+                                  idx, parent, child_point);
+                            Vector2F::zero()
                         }
                     }
-                };
-                child.transform(&Transform2F::from_translation(offset));
-                outline.push_outline(child);
-            }
-            Some(outline)
+                }
+            };
+            // The 2×2 part applies before the placement offset, except for a component that
+            // asks for its offset to be scaled as well (see `Component::scaled_offset`).
+            let placement = Transform2F { matrix: part.matrix, vector: offset };
+            out.extend(children.into_iter().map(|(gid, transform)| (gid, placement * transform)));
+            points.extend(contours.into_iter()
+                .map(|contour| contour.into_iter().map(|point| point + offset).collect()));
         }
     };
     stack.pop();
-    result
+    (out, points)
+}
+
+/// The simple glyphs a glyph is made of: one entry for a simple glyph, the flattened components
+/// for a composite (see `expand_components`).
+fn get_components(shapes: &[GlyfShape], idx: u32) -> Vec<(u32, Transform2F)> {
+    let mut budget = ComponentBudget::new();
+    expand_components(shapes, idx, &mut Vec::new(), &mut budget).0
+}
+
+/// Replays a pathfinder outline through a pen.
+///
+/// Only a composite placed by point matching is expanded into an outline — everything else stays
+/// in the encoder's own representation (see `parse_glyphs`) — so this is how such a glyph gets
+/// back into the shape the encoder wants.
+fn replay_outline(outline: &Outline, pen: &mut impl Pen) {
+    for contour in outline.contours() {
+        if contour.is_empty() {
+            continue;
+        }
+        pen.move_to(contour.position_of(0));
+        for segment in contour.iter(ContourIterFlags::IGNORE_CLOSE_SEGMENT) {
+            match segment.kind {
+                SegmentKind::Line => pen.line_to(segment.baseline.to()),
+                SegmentKind::Quadratic => pen.quad_to(segment.ctrl.from(), segment.baseline.to()),
+                SegmentKind::Cubic =>
+                    pen.cubic_to(segment.ctrl.from(), segment.ctrl.to(), segment.baseline.to()),
+                SegmentKind::None => {}
+            }
+        }
+        pen.close();
+    }
+}
+
+fn encode_outline<E: Encoder>(outline: &Outline, encoder: &mut E) -> Result<Shape<E>, FontError> {
+    let (_, glyph) = encoder.encode_shape::<(), Infallible>(|pen| {
+        replay_outline(outline, pen);
+        Ok(())
+    }).unwrap();
+    Ok(Shape::Simple(glyph))
+}
+
+/// One parsed glyph, in the encoder's representation.
+pub(crate) fn encode_shape<E: Encoder>(shape: &GlyfShape, shapes: &[GlyfShape], idx: u32, encoder: &mut E)
+    -> Result<Shape<E>, FontError>
+{
+    match *shape {
+        GlyfShape::Empty => Ok(Shape::Empty),
+        GlyfShape::Simple(ref outline) => encode_outline(outline, encoder),
+        GlyfShape::Compound(ref parts) => {
+            if parts.is_empty() {
+                return Ok(Shape::Empty);
+            }
+            let mut budget = ComponentBudget::new();
+            let (children, _) = expand_components(shapes, idx, &mut Vec::new(), &mut budget);
+            if children.is_empty() {
+                return Ok(Shape::Empty);
+            }
+            Ok(Shape::Compound(children.into_iter()
+                .map(|(gid, transform)| (GlyphId(gid), transform))
+                .collect()))
+        }
+    }
+}
+
+/// Parses every glyph of a `glyf`/`loca` font into the encoder's representation.
+///
+/// The parse itself has to work on outlines (`GlyfShape`): a composite placed by point matching
+/// needs their points. Only then is each glyph handed to the encoder, one `encode_shape` call
+/// per glyph, which is where the backend decides what a glyph is made of.
+pub fn parse_glyphs<E: Encoder>(loca: &[u32], data: &[u8], hmtx: &Hmtx, encoder: &mut E)
+    -> Result<Vec<Glyph<E>>, FontError>
+{
+    let shapes = parse_shapes(loca, data)?;
+    let mut glyphs = Vec::with_capacity(shapes.len());
+    for (i, shape) in shapes.iter().enumerate() {
+        let shape = encode_shape(shape, &shapes, i as u32, encoder)?;
+        // OT §hmtx: ids at or beyond `numGlyphs` have no metrics, and cannot be glyphs either.
+        let metrics = hmtx.metrics_for_gid(i as u16).unwrap_or_default();
+        glyphs.push(Glyph { shape, metrics });
+    }
+    Ok(glyphs)
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -517,7 +601,7 @@ fn parse_coord(short: bool, same_or_pos: bool) -> impl Fn(&[u8]) -> R<i16> {
 fn mid(a: Vector2F, b: Vector2F) -> Vector2F {
     (a + b) * 0.5
 }
-fn glyph_shape_positive_contours(i: &[u8], number_of_contours: usize) -> Result<Shape, FontError> {
+fn glyph_shape_positive_contours(i: &[u8], number_of_contours: usize) -> Result<GlyfShape, FontError> {
     let (i, point_indices) = take(2 * number_of_contours)(i)?;
     let (i, num_instructions) = be_u16(i)?;
     let (mut i, _instructions) = take(num_instructions)(i)?;
@@ -570,7 +654,7 @@ fn glyph_shape_positive_contours(i: &[u8], number_of_contours: usize) -> Result<
         }
     }
     
-    Ok(Shape::Simple(outline))
+    Ok(GlyfShape::Simple(outline))
 }
 
 pub fn contour(points: impl Iterator<Item=(bool, Vector2F)>) -> Option<Contour> {
@@ -650,7 +734,7 @@ mod tests {
     use std::time::Instant;
 
     /// One triangle.
-    fn leaf() -> Shape {
+    fn leaf() -> GlyfShape {
         let mut outline = Outline::new();
         let contour = contour(
             vec![
@@ -660,21 +744,24 @@ mod tests {
             ].into_iter(),
         ).expect("triangle");
         outline.push_contour(contour);
-        Shape::Simple(outline)
+        GlyfShape::Simple(outline)
+    }
+
+    fn component(gid: u32, matrix: Matrix2x2F, offset: Vector2F) -> Component {
+        Component { gid, matrix, offset: ComponentOffset::Vector(offset), scaled_offset: false }
+    }
+
+    fn identity() -> Matrix2x2F {
+        Matrix2x2F::row_major(1., 0., 0., 1.)
     }
 
     /// Glyph `n` is two components of glyph `n + 1`, the last one is a plain leaf: the
     /// expansion is `2 ^ depth` outlines.
-    fn doubling_chain(depth: u32) -> Vec<Shape> {
-        let component = |gid| Component {
-            gid,
-            matrix: Matrix2x2F::row_major(1., 0., 0., 1.),
-            offset: ComponentOffset::Vector(Vector2F::zero()),
-            scaled_offset: false,
-        };
+    fn doubling_chain(depth: u32) -> Vec<GlyfShape> {
         let mut shapes = Vec::new();
         for level in 0 .. depth {
-            shapes.push(Shape::Compound(vec![component(level + 1), component(level + 1)]));
+            let part = component(level + 1, identity(), Vector2F::zero());
+            shapes.push(GlyfShape::Compound(vec![part, part]));
         }
         shapes.push(leaf());
         shapes
@@ -690,15 +777,12 @@ mod tests {
         }
         let mut outline = Outline::new();
         outline.push_contour(contour(points.into_iter()).expect("big contour"));
-        let component = Component {
-            gid: 1,
-            matrix: Matrix2x2F::row_major(1., 0., 0., 1.),
-            offset: ComponentOffset::Vector(Vector2F::zero()),
-            scaled_offset: false,
-        };
-        let shapes = vec![Shape::Compound(vec![component; 5000]), Shape::Simple(outline)];
-        let copied: usize = get_outline(&shapes, 0).expect("glyph 0").contours().iter()
-            .map(|contour| contour.points().len()).sum();
+        let part = component(1, identity(), Vector2F::zero());
+        let shapes = vec![GlyfShape::Compound(vec![part; 5000]), GlyfShape::Simple(outline)];
+        let mut budget = ComponentBudget::new();
+        let (children, contours) = expand_components(&shapes, 0, &mut Vec::new(), &mut budget);
+        let copied: usize = contours.iter().map(|contour| contour.len()).sum();
+        assert!(!children.is_empty(), "the budget must leave some of the glyph");
         assert!(copied > 0 && copied <= MAX_COMPONENT_POINTS + 1000, "copied {} points", copied);
     }
 
@@ -709,14 +793,55 @@ mod tests {
         // expanded; with it the expansion stops at MAX_COMPONENT_EXPANSIONS.
         let shapes = doubling_chain(14);
         let start = Instant::now();
-        let outline = get_outline(&shapes, 0).expect("composite glyph 0");
-        let contours = outline.contours().len();
+        let children = get_components(&shapes, 0);
         assert!(start.elapsed().as_secs() < 2, "expansion took {:?}", start.elapsed());
-        assert!(contours > 0, "the budget must leave some of the glyph");
+        assert!(!children.is_empty(), "the budget must leave some of the glyph");
         assert!(
-            contours <= MAX_COMPONENT_EXPANSIONS,
-            "{} contours: the component budget did not stop the expansion",
-            contours
+            children.len() <= MAX_COMPONENT_EXPANSIONS,
+            "{} components: the component budget did not stop the expansion",
+            children.len()
         );
+    }
+
+    #[test]
+    fn a_composite_that_names_a_composite_is_flattened() {
+        // A backend is only promised simple glyphs inside `Shape::Compound`, so a nested
+        // composite has to come out of the expansion as its leaves, with the transforms
+        // composed: scaled by 2 and moved by (1, 0), then moved by (10, 20).
+        let shapes = vec![
+            GlyfShape::Compound(vec![component(1, identity(), Vector2F::new(10., 20.))]),
+            GlyfShape::Compound(vec![component(
+                2,
+                Matrix2x2F::from_scale(Vector2F::splat(2.)),
+                Vector2F::new(1., 0.),
+            )]),
+            leaf(),
+        ];
+        let children = get_components(&shapes, 0);
+        assert_eq!(children.len(), 1, "{:?}", children);
+        let (gid, transform) = children[0];
+        assert_eq!(gid, 2);
+        assert_eq!(transform * Vector2F::zero(), Vector2F::new(11., 20.));
+        assert_eq!(transform * Vector2F::new(1., 1.), Vector2F::new(13., 22.));
+    }
+
+    #[test]
+    fn a_composite_that_contains_itself_draws_nothing() {
+        let shapes = vec![GlyfShape::Compound(vec![component(0, identity(), Vector2F::zero())])];
+        assert!(get_components(&shapes, 0).is_empty());
+    }
+
+    #[test]
+    fn a_missing_component_is_skipped() {
+        let shapes = vec![
+            GlyfShape::Compound(vec![
+                component(7, identity(), Vector2F::zero()),
+                component(1, identity(), Vector2F::new(5., 0.)),
+            ]),
+            leaf(),
+        ];
+        let children = get_components(&shapes, 0);
+        assert_eq!(children.len(), 1, "{:?}", children);
+        assert_eq!(children[0].0, 1);
     }
 }

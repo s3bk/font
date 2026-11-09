@@ -3,6 +3,10 @@
 //! Each case builds the smallest sfnt that still reaches the code under test, so a failure names
 //! exactly one rule. Run everything: `cargo test`; one group: `cargo test c01`.
 
+mod common;
+
+use common::{outline, OutlineEncoder};
+
 use font::opentype::{cmap::parse_cmap, gdef::{GDef, MarkClass}, OpenTypeFont};
 use font::{Font, GlyphId};
 
@@ -148,7 +152,7 @@ pub fn gdef_table(glyph_class: Option<Vec<u8>>, mark_attach_class: Option<Vec<u8
 }
 
 fn parse_gdef_of(data: &[u8]) -> GDef {
-    let font = OpenTypeFont::parse(data).expect("font parses");
+    let font = OpenTypeFont::parse(data, &mut OutlineEncoder).expect("font parses");
     font.gdef.expect("GDEF present")
 }
 
@@ -238,7 +242,7 @@ fn pair_pos_2(covered: &[u16], class_def_1: &[u8], class_def_2: &[u8],
 }
 
 fn kerning_of(data: &[u8], left: u32, right: u32) -> f32 {
-    let font = OpenTypeFont::parse(data).expect("font parses");
+    let font = OpenTypeFont::parse(data, &mut OutlineEncoder).expect("font parses");
     font.kerning(GlyphId(left), GlyphId(right))
 }
 
@@ -603,7 +607,7 @@ fn c13_hmtx_clamps_zero_number_of_hmetrics() {
     // costing the whole font — 0 used to reject.
     let mut tables = base_tables(2);
     tables[1].1 = hhea_table(0);
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("numberOfHMetrics = 0 loads");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("numberOfHMetrics = 0 loads");
     assert_eq!(font.glyph_metrics(0).map(|m| m.advance), Some(500.0));
 }
 
@@ -615,7 +619,7 @@ fn c13b_hmtx_accepts_missing_trailing_lsbs() {
     let mut tables = base_tables(3);
     tables[1].1 = hhea_table(2);
     tables[3].1 = hmtx_table(2);
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("a short bearing array loads");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("a short bearing array loads");
     assert_eq!(font.glyph_metrics(0).map(|m| m.advance), Some(500.0));
     assert!(font.glyph_metrics(2).is_none(), "glyph 2 has no bearing of its own");
 }
@@ -624,7 +628,7 @@ fn c13b_hmtx_accepts_missing_trailing_lsbs() {
 fn c13c_hmtx_has_no_metric_for_gid_at_or_beyond_num_glyphs() {
     // `metrics_for_gid` used to invent (last_advance, 0) for any gid.
     let tables = base_tables(2);
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("font parses");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("font parses");
     assert!(font.glyph_metrics(2).is_none());
     assert_eq!(font.glyph_metrics(1).map(|m| m.advance), Some(500.0));
 }
@@ -638,7 +642,7 @@ fn c14_head_rejects_units_per_em_zero() {
     head[19] = 0;
     let mut tables = base_tables(2);
     tables[0].1 = head;
-    assert!(OpenTypeFont::parse(&build_font(tables)).is_err());
+    assert!(OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).is_err());
 }
 
 #[test]
@@ -650,7 +654,7 @@ fn c14c_head_keeps_a_units_per_em_outside_the_spec_range() {
     head[19] = 8;
     let mut tables = base_tables(2);
     tables[0].1 = head;
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("unitsPerEm = 8 loads");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("unitsPerEm = 8 loads");
     assert_eq!(font.num_glyphs(), 2);
     assert_eq!(font.glyph_metrics(0).map(|m| m.advance), Some(500.0));
 }
@@ -663,7 +667,7 @@ fn c14b_maxp_reads_an_unknown_version() {
     maxp[1] = 2; // 0x00020000
     let mut tables = base_tables(2);
     tables[2].1 = maxp;
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("maxp 2.0 loads");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("maxp 2.0 loads");
     assert_eq!(font.num_glyphs(), 2);
 }
 
@@ -673,7 +677,7 @@ fn c15_kern_horizontal_subtable_may_also_be_minimum() {
     // applies; the crate required exactly 0x01 and failed the whole font.
     let mut tables = base_tables(2);
     tables.push((*b"kern", kern_table_ms(0, 0x03, &kern_pairs(&[(0, 1, -50)]))));
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("kern coverage 0x03 must load");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("kern coverage 0x03 must load");
     assert_eq!(font.kerning(GlyphId(0), GlyphId(1)), -50.0);
 }
 
@@ -683,7 +687,7 @@ fn c15b_vertical_kern_subtable_is_skipped_not_fatal() {
     // subtable is skipped. It must not take the font down.
     let mut tables = base_tables(2);
     tables.push((*b"kern", kern_table_ms(0, 0x00, &kern_pairs(&[(0, 1, -50)]))));
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("vertical kern must load");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("vertical kern must load");
     assert_eq!(font.kerning(GlyphId(0), GlyphId(1)), 0.0);
 }
 
@@ -702,7 +706,7 @@ fn c16_one_corrupt_glyph_does_not_fail_the_font() {
     let mut tables = base_tables(2);
     tables.push((*b"loca", loca));
     tables.push((*b"glyf", glyf));
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("one bad glyph must not fail the font");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("one bad glyph must not fail the font");
     assert_eq!(font.num_glyphs(), 2);
     assert!(font.is_empty_glyph(GlyphId(1)));
 }
@@ -716,7 +720,7 @@ fn c16b_loca_that_runs_backwards_leaves_the_glyph_empty() {
     let mut glyf = vec![0u8; 10];
     glyf[1] = 0; // shape data is irrelevant, the offsets are wrong
     tables.push((*b"glyf", glyf));
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("a backwards loca pair loads");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("a backwards loca pair loads");
     assert_eq!(font.num_glyphs(), 2);
     assert!(font.is_empty_glyph(GlyphId(1)));
 }
@@ -728,7 +732,7 @@ fn c16c_loca_past_the_end_of_glyf_leaves_those_glyphs_empty() {
     let mut tables = base_tables(2);
     tables.push((*b"loca", loca_table_short(&[0, 0, 100])));
     tables.push((*b"glyf", vec![0u8; 10]));
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("an oversized last loca loads");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("an oversized last loca loads");
     assert_eq!(font.num_glyphs(), 2);
     assert!(font.is_empty_glyph(GlyphId(0)));
     assert!(font.is_empty_glyph(GlyphId(1)));
@@ -816,20 +820,20 @@ pub fn glyf_and_loca(glyphs: &[Vec<u8>]) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// A TrueType font carrying exactly these glyph records.
-pub fn font_with_glyphs(glyphs: &[Vec<u8>]) -> OpenTypeFont {
+pub fn font_with_glyphs(glyphs: &[Vec<u8>]) -> OpenTypeFont<OutlineEncoder> {
     let (glyf, loca) = glyf_and_loca(glyphs);
     let mut tables = base_tables(glyphs.len() as u16);
     tables.push((*b"loca", loca));
     tables.push((*b"glyf", glyf));
-    OpenTypeFont::parse(&build_font(tables)).expect("font parses")
+    OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("font parses")
 }
 
 /// Every point of a glyph's outline, in contour order, without the closing point that
 /// `contour()` appends (so the indices are the ones OT §glyf uses).
-pub fn outline_points(font: &OpenTypeFont, gid: u16) -> Vec<(f32, f32)> {
-    let glyph = font.glyph(GlyphId(gid as u32)).expect("glyph exists");
+pub fn outline_points(font: &OpenTypeFont<OutlineEncoder>, gid: u16) -> Vec<(f32, f32)> {
+    let glyph = outline(font, GlyphId(gid as u32));
     let mut out = Vec::new();
-    for contour in glyph.path.contours() {
+    for contour in glyph.contours() {
         let points = contour.points();
         let points = if points.len() > 1 && points[0] == points[points.len() - 1] {
             &points[.. points.len() - 1]
@@ -983,7 +987,7 @@ fn c18b_unknown_gsub_minor_version_is_ignored() {
     let mut tables = base_tables(2);
     tables.push((*b"GSUB", gsub_table(2)));
     let data = build_font(tables);
-    let font = OpenTypeFont::parse(&data).expect("GSUB 1.2 parses");
+    let font = OpenTypeFont::parse(&data, &mut OutlineEncoder).expect("GSUB 1.2 parses");
     assert!(font.gsub.is_some());
 }
 
@@ -1060,13 +1064,13 @@ pub fn os2_table(fs_selection: u16, typo: (i16, i16, i16), x_height: i16, cap_he
 }
 
 /// Two empty glyphs plus the given `OS/2` table.
-fn font_with_os2(fs_selection: u16) -> OpenTypeFont {
+fn font_with_os2(fs_selection: u16) -> OpenTypeFont<OutlineEncoder> {
     let (glyf, loca) = glyf_and_loca(&[Vec::new(), Vec::new()]);
     let mut tables = base_tables(2);
     tables.push((*b"loca", loca));
     tables.push((*b"glyf", glyf));
     tables.push((*b"OS/2", os2_table(fs_selection, (900, -300, 120), 500, 700)));
-    OpenTypeFont::parse(&build_font(tables)).expect("font parses")
+    OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("font parses")
 }
 
 #[test]
@@ -1109,7 +1113,7 @@ fn c25c_os2_truncated_inside_the_codepage_ranges_has_no_heights() {
     tables.push((*b"loca", loca));
     tables.push((*b"glyf", glyf));
     tables.push((*b"OS/2", data));
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("font parses");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("font parses");
     assert_eq!(font.info().x_height, None);
     assert_eq!(font.info().cap_height, None);
     // The fixed prefix is still read.
@@ -1254,13 +1258,13 @@ pub fn gzip_stored(data: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(feature = "svg")]
-fn font_with_svg(document: &[u8]) -> Box<dyn Font + Send + Sync + 'static> {
+fn font_with_svg(document: &[u8]) -> font::FontVariant<OutlineEncoder> {
     let (glyf, loca) = glyf_and_loca(&[Vec::new(), Vec::new()]);
     let mut tables = base_tables(2);
     tables.push((*b"loca", loca));
     tables.push((*b"glyf", glyf));
     tables.push((*b"SVG ", svg_table(&[document])));
-    font::parse(&build_font(tables)).expect("font with an SVG table parses")
+    font::parse(&build_font(tables), &mut OutlineEncoder).expect("font with an SVG table parses")
 }
 
 #[cfg(feature = "svg")]
@@ -1310,7 +1314,7 @@ fn c26c_a_document_that_cannot_be_decompressed_costs_only_itself() {
     tables.push((*b"loca", loca));
     tables.push((*b"glyf", glyf));
     tables.push((*b"SVG ", t));
-    let font = font::parse(&build_font(tables)).expect("one broken document must not fail the table");
+    let font = font::parse(&build_font(tables), &mut OutlineEncoder).expect("one broken document must not fail the table");
     assert!(font.svg_glyph(GlyphId(65)).is_some(), "the readable document still loads");
     assert!(font.svg_glyph(GlyphId(64)).is_none());
 }
@@ -1348,7 +1352,7 @@ fn c48_a_broken_gpos_subtable_does_not_cost_the_other_subtables() {
         t.push((*b"GPOS", gpos_two_subtables(2, &[0, 1], &pair_pos_1(1, &[(2, -30)]))));
         t
     };
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("font with a broken GPOS subtable parses");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("font with a broken GPOS subtable parses");
     assert_eq!(font.kerning(GlyphId(1), GlyphId(2)), -30.0,
                "the readable subtable of the same lookup still kerns");
 }
@@ -1360,7 +1364,7 @@ fn c48b_a_broken_gsub_drops_the_table_not_the_font() {
     gsub[8..10].copy_from_slice(&0xffffu16.to_be_bytes()); // lookupListOffset, past the end
     let mut tables = base_tables(8);
     tables.push((*b"GSUB", gsub));
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("font with an unreadable GSUB parses");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("font with an unreadable GSUB parses");
     assert!(font.gsub.is_none(), "the GSUB that cannot be read is dropped");
 }
 
@@ -1371,6 +1375,6 @@ fn c48c_a_truncated_gdef_drops_the_table_not_the_font() {
     gdef.truncate(8);
     let mut tables = base_tables(8);
     tables.push((*b"GDEF", gdef));
-    let font = OpenTypeFont::parse(&build_font(tables)).expect("font with a truncated GDEF parses");
+    let font = OpenTypeFont::parse(&build_font(tables), &mut OutlineEncoder).expect("font with a truncated GDEF parses");
     assert!(font.gdef.is_none(), "the GDEF that cannot be read is dropped");
 }

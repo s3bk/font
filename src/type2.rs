@@ -1,5 +1,6 @@
-use crate::{State, Seac, v, Value, Context, TryIndex, FontError, MAX_SUBR_DEPTH, TRANSIENT_SIZE};
-use nom::{IResult,
+use crate::{
+    Context, FontError, MAX_SUBR_DEPTH, Pen, Seac, State, TRANSIENT_SIZE, TryIndex, Value, v,
+};use nom::{IResult,
     bytes::complete::{take},
     number::complete::{be_u8, be_i16, be_i32}
 };
@@ -32,7 +33,7 @@ macro_rules! bezier {
             let c1 = $s.current + point!(iter, $a);
             let c2 = c1 + point!(iter, $b);
             let p = c2 + point!(iter, $c);
-            $s.contour.push_cubic(c1, c2, p);
+            $s.pen.cubic_to(c1, c2, p);
             $s.current = p;
         )*
         iter.as_slice()
@@ -43,14 +44,14 @@ macro_rules! lines {
         let mut iter = $slice.iter();
         $(
             let p = $s.current + point!(iter, $a);
-            $s.contour.push_endpoint(p);
+            $s.pen.line_to(p);
             $s.current = p;
         )*
         iter.as_slice()
     });
 }
 
-fn alternating_curve(s: &mut State, mut horizontal: bool) -> Result<(), FontError> {
+fn alternating_curve(s: &mut State<impl Pen>, mut horizontal: bool) -> Result<(), FontError> {
     let mut slice = s.stack.as_slice();
     while slice.len() > 0 {
         slice = match (slice.len(), horizontal) {
@@ -73,7 +74,7 @@ fn is_true(value: Value) -> bool {
 }
 
 #[inline]
-fn maybe_width(state: &mut State, cond: impl Fn(usize) -> bool) {
+fn maybe_width(state: &mut State<impl Pen>, cond: impl Fn(usize) -> bool) {
     if state.first_stack_clearing_operator {
         state.first_stack_clearing_operator = false;
         if !cond(state.stack.len()) {
@@ -82,12 +83,12 @@ fn maybe_width(state: &mut State, cond: impl Fn(usize) -> bool) {
         }
     }
 }
-
 /// Run one subroutine, guarding against subrs that call themselves.
 ///
 /// The depth is restored afterwards even when the subr fails, so one bad glyph does
 /// not poison the counter for the next one.
-fn call_subr<'a, 'b, T, U>(subr: &'a [u8], ctx: &'a Context<T, U>, s: &'b mut State) -> Result<(), FontError>
+fn call_subr<'a, 'b, T, U>(subr: &'a [u8], ctx: &'a Context<T, U>, s: &'b mut State<impl Pen>)
+    -> Result<(), FontError>
     where T: TryIndex + 'a, U: TryIndex + 'a
 {
     if s.subr_depth >= MAX_SUBR_DEPTH {
@@ -99,8 +100,7 @@ fn call_subr<'a, 'b, T, U>(subr: &'a [u8], ctx: &'a Context<T, U>, s: &'b mut St
     result
 }
 
-pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: &'b mut State) -> Result<(), FontError>
-    where T: TryIndex + 'a, U: TryIndex + 'a
+pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: &mut State<'_, impl Pen>) -> Result<(), FontError>    where T: TryIndex + 'a, U: TryIndex + 'a
 {
     while input.len() > 0 && !s.done {
         let (i, b0) = be_u8(input)?;
@@ -128,11 +128,10 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
             4 => { // ⊦ dy vmoveto (4) ⊦
                 trace!("vmoveto");
                 require!(s.stack.len() >= 1);
-                s.flush();
 
                 maybe_width(s, |n| n == 1);
                 let p = s.current + v(0., s.stack[0]);
-                s.contour.push_endpoint(p);
+                s.pen.move_to(p);
                 s.stack.clear();
                 s.current = p;
                 i
@@ -156,7 +155,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                         v(0., d)
                     };
                     let p = s.current + dv;
-                    s.contour.push_endpoint(p);
+                    s.pen.line_to(p);
                     s.current = p;
                 }
                 s.stack.clear();
@@ -172,7 +171,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                         v(d, 0.)
                     };
                     let p = s.current + dv;
-                    s.contour.push_endpoint(p);
+                    s.pen.line_to(p);
                     s.current = p;
                 }
                 s.stack.clear();
@@ -403,7 +402,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                         let c1 = s.current + point!(iter, xy);
                         let c2 = c1 + point!(iter, xy);
                         let join = c2 + point!(iter, x);
-                        s.contour.push_cubic(c1, c2, join);
+                        s.pen.cubic_to(c1, c2, join);
 
                         let c3 = join + point!(iter, x);
                         let c4 = c3 + point!(iter, xy);
@@ -412,7 +411,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                             dx6.to_float()
                         };
                         let end = c4 + v(dx6, dy6);
-                        s.contour.push_cubic(c3, c4, end);
+                        s.pen.cubic_to(c3, c4, end);
                         s.current = end;
                         s.stack.clear();
                         i
@@ -439,7 +438,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                             true => point!(iter, x),
                             false => point!(iter, y)
                         };
-                        s.contour.push_cubic(d4, d5, d6);
+                        s.pen.cubic_to(d4, d5, d6);
                         s.current = d6;
                         s.stack.clear();
                         i
@@ -463,7 +462,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                     let bchar = s.stack[2].to_float();
                     let achar = s.stack[3].to_float();
                     if !(0.0 ..= 255.0).contains(&bchar) || !(0.0 ..= 255.0).contains(&achar) {
-                        warn!("endchar seac: character code out of range ({bchar}, {achar})");
+                        warn!("endchar seac: character code out of range ({}, {})", bchar, achar);
                     } else {
                         s.seac = Some(Seac {
                             adx, ady,
@@ -479,8 +478,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                     warn!("endchar with {} operands is not a seac, ignoring them",
                           s.stack.len());
                 }
-                s.contour.close();
-                s.done = true;
+                s.pen.close();                s.done = true;
                 i
             }
             15 | 16 | 17 => error!("reserved {}", b0),
@@ -511,9 +509,8 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                 trace!("rmoveto");
                 require!(s.stack.len() >= 2);
                 maybe_width(s, |n| n == 2);
-                s.flush();
                 let p = s.current + v(s.stack[0], s.stack[1]);
-                s.contour.push_endpoint(p);
+                s.pen.move_to(p);
                 s.current = p;
                 s.stack.clear();
                 i
@@ -522,9 +519,8 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                 trace!("hmoveto");
                 require!(s.stack.len() >= 1);
                 maybe_width(s, |n| n == 1);
-                s.flush();
                 let p = s.current + v(s.stack[0], 0.);
-                s.contour.push_endpoint(p);
+                s.pen.move_to(p);
                 s.current = p;
                 s.stack.clear();
                 i

@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::iter::once;
 use std::borrow::Cow;
 use std::rc::Rc;
+use crate::opentype::Hmtx;
 use crate::{
-    Font, Glyph, Value, Context, State, Seac, type1, type2, IResultExt, R,
+    Encoder, Font, Glyph, Shape, Value, Context, State, Seac, type1, type2, IResultExt, R,
     VMetrics, HMetrics, GlyphId, Name, Info, FontError, ParseResult,
 };
 use crate::parsers::count as count2;
@@ -24,8 +25,8 @@ use pathfinder_geometry::{vector::Vector2F, transform2d::Transform2F, rect::Rect
 use tuple::TupleElements;
 
 #[derive(Clone)]
-pub struct CffFont {
-    glyphs: Vec<Glyph>,
+pub struct CffFont<E: Encoder> {
+    glyphs: Vec<Glyph<E>>,
     font_matrix: Transform2F,
     pub codepoint_map: [u16; 256],  // codepoint -> glyph index
     name_map: HashMap<String, u16>,
@@ -39,27 +40,27 @@ pub struct CffFont {
     pub cid: bool,
 }
 
-impl CffFont {
-    pub fn parse(data: &[u8], idx: u32) -> Result<Self, FontError> {
+impl<E: Encoder> CffFont<E> {
+    pub fn parse(data: &[u8], idx: u32, encoder: &mut E) -> Result<Self, FontError> {
         let cff = t!(read_cff(data));
         let slot = t!(cff.slot(idx));
-        let font = t!(slot.parse_font());
+        let font = t!(slot.parse_font(encoder));
         Ok(font)
     }
 }
-impl Font for CffFont {
+impl<E: Encoder + 'static> Font<E> for CffFont<E> {
     fn num_glyphs(&self) -> u32 {
         self.glyphs.len() as u32
     }
     fn font_matrix(&self) -> Transform2F {
         self.font_matrix
     }
-    fn glyph(&self, id: GlyphId) -> Option<Glyph> {
-        self.glyphs.get(id.0 as usize).cloned()
+    fn glyph(&self, id: GlyphId) -> Option<&Glyph<E>> {
+        self.glyphs.get(id.0 as usize)
     }
 
     fn is_empty_glyph(&self, gid: GlyphId) -> bool {
-        self.glyphs.get(gid.0 as usize).map(|g| g.path.len() == 0).unwrap_or(true)
+        self.glyphs.get(gid.0 as usize).map(|g| g.shape.is_empty()).unwrap_or(true)
     }
     fn gid_for_codepoint(&self, codepoint: u32) -> Option<GlyphId> {
         match self.codepoint_map.get(codepoint as usize) {
@@ -311,8 +312,8 @@ impl<'a> CffSlot<'a> {
                 RectF::from_points(Vector2F::new(a, b), Vector2F::new(c, d))
             })
     }
-    // -> (outline, width, lsb, seac)
-    pub fn outlines(&self) -> Result<impl Iterator<Item=Result<(Outline, f32, f32, Option<Seac>), FontError>> + '_, FontError> {
+    // -> (shape, width, lsb, seac)
+    pub fn outlines<'e, E: Encoder>(&'e self, encoder: &'e mut E) -> Result<impl Iterator<Item=Result<(Shape<E>, f32, f32, Option<Seac>), FontError>> + 'e, FontError> {
         let n = self.top_dict.get(&Operator::CharstringType).map(|v| get!(v, 0).to_int()).transpose()?.unwrap_or(2);
         let char_string_type = match n {
             1 => CharstringType::Type1,
@@ -327,53 +328,53 @@ impl<'a> CffSlot<'a> {
         };
         
         // build glyphs
-        let mut state = State::new();
         Ok(self.char_strings.iter().enumerate().map(move |(id, data)| {
             trace!("charstring for glyph {}", id);
-            let subr_bias = match char_string_type {
-                CharstringType::Type2 => bias(self.subrs[id].len()),
-                CharstringType::Type1 => 0
-            };
-            let context = Context {
-                subr_bias,
-                subrs: self.subrs[id].as_slice(),
-                global_subrs: self.cff.subroutines.as_slice(),
-                global_subr_bias
-            };
-            match char_string_type {
-                CharstringType::Type1 => {
-                    t!(type1::charstring(data, &context, &mut state));
-                },
-                CharstringType::Type2 => {
-                    t!(type2::charstring(data, &context, &mut state));
+            encoder.encode_shape(|pen| {
+                let mut state = State::new(pen, vec![]);
+                let subr_bias = match char_string_type {
+                    CharstringType::Type2 => bias(self.subrs[id].len()),
+                    CharstringType::Type1 => 0
+                };
+                let context = Context {
+                    subr_bias,
+                    subrs: self.subrs[id].as_slice(),
+                    global_subrs: self.cff.subroutines.as_slice(),
+                    global_subr_bias
+                };
+                match char_string_type {
+                    CharstringType::Type1 => {
+                        t!(type1::charstring(data, &context, &mut state));
+                    },
+                    CharstringType::Type2 => {
+                        t!(type2::charstring(data, &context, &mut state));
+                    }
                 }
-            }
-            let default_width = self.private_dict[id].get(&Operator::DefaultWidthX)
-                .map(|a| Ok(get!(a, 0).to_float())).
-                transpose()?
-                .unwrap_or(0.);
-            let nominal_width = self.private_dict[id].get(&Operator::NominalWidthX)
-                .map(|a| Ok(get!(a, 0).to_float()))
-                .transpose()?
-                .unwrap_or(0.);
-            
-            trace!("glyph {} {:?} {:?}", id, state.char_width, state.delta_width);
-            let width = match (state.char_width, state.delta_width) {
-                (Some(w), None) => w,
-                (None, None) => default_width,
-                (None, Some(delta)) => delta + nominal_width,
-                // TN5177 §3: a charstring may set its width once, with either encoding. Both at
-                // the same time is a producer bug; keep the explicit width and carry on.
-                (Some(w), Some(_)) => {
-                    warn!("glyph {}: charstring set both an explicit and a delta width, using {}", id, w);
-                    w
-                }
-            };
-            let lsb = state.lsb.unwrap_or_default();
-            let path = state.take_path();
-            let seac = state.seac;
-            state.clear();
-            Ok((path, width, lsb, seac))
+                let default_width = self.private_dict[id].get(&Operator::DefaultWidthX)
+                    .map(|a| Ok(get!(a, 0).to_float())).
+                    transpose()?
+                    .unwrap_or(0.);
+                let nominal_width = self.private_dict[id].get(&Operator::NominalWidthX)
+                    .map(|a| Ok(get!(a, 0).to_float()))
+                    .transpose()?
+                    .unwrap_or(0.);
+
+                trace!("glyph {} {:?} {:?}", id, state.char_width, state.delta_width);
+                let width = match (state.char_width, state.delta_width) {
+                    (Some(w), None) => w,
+                    (None, None) => default_width,
+                    (None, Some(delta)) => delta + nominal_width,
+                    // TN5177 §3: a charstring may set its width once, with either encoding. Both at
+                    // the same time is a producer bug; keep the explicit width and carry on.
+                    (Some(w), Some(_)) => {
+                        warn!("glyph {}: charstring set both an explicit and a delta width, using {}", id, w);
+                        w
+                    }
+                };
+                let lsb = state.lsb.unwrap_or_default();
+                let seac = state.seac;
+                Ok((lsb, width, seac))
+            }).map(|((lsb, width, seac), path)| (Shape::Simple(path), width, lsb, seac))
         }))
     }
 
@@ -409,15 +410,20 @@ impl<'a> CffSlot<'a> {
 
     /// `outlines()` with the deprecated four-argument `endchar` form (`seac`) composed:
     /// the base character with the accent character drawn at (adx, ady) on top.
-    pub fn composed_outlines(&self) -> Result<Vec<(Outline, f32, f32)>, FontError> {
+    ///
+    /// The composition stays deferred: the glyph is reported as a `Compound` of its base
+    /// (untransformed) and its accent (translated by `adx + sbx - asb`, `ady`), so an encoder
+    /// that already resolves composite glyphs renders it without a second copy of the outlines
+    /// here (T1 §6; TN5177 Appendix C).
+    pub fn composed_outlines<E: Encoder>(&self, encoder: &mut E) -> Result<Vec<(Shape<E>, f32, f32)>, FontError> {
         let mut outlines = Vec::with_capacity(self.num_glyphs);
         let mut seac_glyphs = Vec::new();
-        for r in self.outlines()? {
-            let (outline, width, lsb, seac) = r?;
+        for r in self.outlines(encoder)? {
+            let (shape, width, lsb, seac) = r?;
             if let Some(seac) = seac {
                 seac_glyphs.push((outlines.len(), seac));
             }
-            outlines.push((outline, width, lsb));
+            outlines.push((shape, width, lsb));
         }
         // parse the charset once for the whole pass, not per lookup.
         let sids = if seac_glyphs.is_empty() { None } else { self.sids().ok() };
@@ -438,7 +444,11 @@ impl<'a> CffSlot<'a> {
                     continue;
                 }
             };
-            outlines[gid].0 = seac.compose(outlines[base].0.clone(), outlines[accent].0.clone());
+            let dx = seac.adx + seac.sbx - seac.asb;
+            outlines[gid].0 = Shape::Compound(vec![
+                (GlyphId(base as u32), Transform2F::default()),
+                (GlyphId(accent as u32), Transform2F::from_translation(Vector2F::new(dx, seac.ady))),
+            ]);
         }
         Ok(outlines)
     }
@@ -457,7 +467,7 @@ impl<'a> CffSlot<'a> {
         })
         */
     }
-    fn parse_font(&self) -> Result<CffFont, FontError> {
+    fn parse_font<E: Encoder>(&self, encoder: &mut E) -> Result<CffFont<E>, FontError> {
         let glyph_name = |sid: SID| {
             if let Some(name) = STANDARD_STRINGS.get(sid as usize) {
                 return Ok(name.clone());
@@ -528,13 +538,13 @@ impl<'a> CffSlot<'a> {
         
         // TN5177 Appendix C, deprecated `seac`: glyphs built from two characters are
         // assembled here, where every charstring and the charset are known.
-        let glyphs: Vec<Glyph> = self.composed_outlines()?.into_iter().map(|(outline, width, lsb)| {
+        let glyphs: Vec<Glyph<E>> = self.composed_outlines(encoder)?.into_iter().map(|(shape, width, lsb)| {
             Glyph {
                 metrics: HMetrics {
                     advance: width,
                     lsb
                 },
-                path: outline
+                shape
             }
         }).collect();
         

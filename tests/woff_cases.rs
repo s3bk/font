@@ -2,6 +2,10 @@
 //! parse, so a failing test names exactly one rule.
 #![cfg(feature = "woff")]
 
+mod common;
+
+use common::OutlineEncoder;
+
 use font::Font;
 
 fn push_u16(v: &mut Vec<u8>, x: u16) {
@@ -42,7 +46,7 @@ fn dir_entry(v: &mut Vec<u8>, tag: &[u8; 4], offset: u32, comp: u32, orig: u32) 
 fn c23_woff_collection_is_an_error() {
     // `unimplemented!()` for flavor `ttcf`.
     let data = woff_header(b"ttcf", 0);
-    assert!(font::parse_woff(&data).is_err());
+    assert!(font::parse_woff(&data, &mut OutlineEncoder).is_err());
 }
 
 #[test]
@@ -52,14 +56,14 @@ fn c23b_corrupt_zlib_table_is_an_error() {
     let mut data = woff_header(&[0, 1, 0, 0], 1);
     dir_entry(&mut data, b"glyf", 64, 4, 8);
     data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // not a zlib stream
-    assert!(font::parse_woff(&data).is_err());
+    assert!(font::parse_woff(&data, &mut OutlineEncoder).is_err());
 }
 
 #[test]
 fn c23c_truncated_table_directory_is_an_error() {
     // The directory claims one table but carries none.
     let data = woff_header(&[0, 1, 0, 0], 1);
-    assert!(font::parse_woff(&data).is_err());
+    assert!(font::parse_woff(&data, &mut OutlineEncoder).is_err());
 }
 
 // ---------------------------- tables are read at their offsets ----------------------------
@@ -156,7 +160,7 @@ fn c27_woff_tables_are_read_at_their_offsets() {
         (b"hhea", hhea_table()),
         (b"head", head_table()),  // … head last, but the directory lists head first
     ]);
-    let font = font::parse_woff(&data).expect("the tables are where the directory says");
+    let font = font::parse_woff(&data, &mut OutlineEncoder).expect("the tables are where the directory says");
     assert_eq!(font.num_glyphs(), 3);
     // The head table really was read: unitsPerEm 1000 -> a 1/1000 font matrix.
     assert_eq!(font.font_matrix().m11(), 0.001);
@@ -169,5 +173,5 @@ fn c27b_table_offset_past_the_end_of_the_file_is_an_error() {
     // The first directory entry is `head`; point it far past the end.
     let offset_at = 44 + 4;
     data[offset_at .. offset_at + 4].copy_from_slice(&1_000_000u32.to_be_bytes());
-    assert!(font::parse_woff(&data).is_err());
+    assert!(font::parse_woff(&data, &mut OutlineEncoder).is_err());
 }

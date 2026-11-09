@@ -6,7 +6,11 @@
 //! points of a glyph built from a hand-written charstring.
 #![cfg(feature = "cff")]
 
-use font::{CffFont, Font, Glyph, GlyphId};
+mod common;
+
+use common::{outline, Outline, OutlineEncoder};
+
+use font::{CffFont, Font, GlyphId};
 
 /// CFF DICT / Type 2 charstring integer encoding (TN5176 §"Operand Encoding",
 /// TN5177 §"Charstring Number Encoding"); the two are identical for these values.
@@ -183,20 +187,20 @@ fn build_cff_with_strings(extra_top_dict: &[u8], strings: &[&[u8]]) -> Vec<u8> {
     data
 }
 
-fn glyph(data: &[u8], gid: u32) -> Glyph {
-    let font = CffFont::parse(data, 0).expect("font parses");
-    font.glyph(GlyphId(gid)).expect("glyph exists")
+fn glyph(data: &[u8], gid: u32) -> Outline {
+    let font = CffFont::parse(data, 0, &mut OutlineEncoder).expect("font parses");
+    outline(&font, GlyphId(gid))
+}
+
+/// The advance width of one glyph, which an outline does not carry.
+fn advance(data: &[u8], gid: u32) -> f32 {
+    let font = CffFont::parse(data, 0, &mut OutlineEncoder).expect("font parses");
+    font.glyph(GlyphId(gid)).expect("glyph exists").metrics.advance
 }
 
 /// Every on-curve point of the outline, in order (TN5177 contours).
-fn points(glyph: &Glyph) -> Vec<(f32, f32)> {
-    let mut out = Vec::new();
-    for contour in glyph.path.contours() {
-        for point in contour.points() {
-            out.push((point.x(), point.y()));
-        }
-    }
-    out
+fn points(outline: &Outline) -> Vec<(f32, f32)> {
+    common::points(outline)
 }
 
 #[test]
@@ -212,7 +216,7 @@ fn c06_hstem_takes_no_width_when_the_argument_count_is_even() {
     let data = build_cff(&[14], &cs);
 
     assert_eq!(
-        glyph(&data, 1).metrics.advance,
+        advance(&data, 1),
         0.0,
         "10 20 30 40 hstem is two stem hints and no width"
     );
@@ -230,7 +234,7 @@ fn c06b_hstem_width_is_the_odd_argument() {
     cs.push(14); // endchar
     let data = build_cff(&[14], &cs);
 
-    assert_eq!(glyph(&data, 1).metrics.advance, 500.0);
+    assert_eq!(advance(&data, 1), 500.0);
 }
 
 #[test]
@@ -244,7 +248,7 @@ fn c06c_vstem_takes_no_width_when_the_argument_count_is_even() {
     cs.push(14); // endchar
     let data = build_cff(&[14], &cs);
 
-    assert_eq!(glyph(&data, 1).metrics.advance, 0.0);
+    assert_eq!(advance(&data, 1), 0.0);
 }
 
 #[test]
@@ -423,7 +427,7 @@ fn c19_unknown_charstring_type_is_an_error() {
     push_int(3, &mut extra);
     extra.extend_from_slice(&[12, 6]); // CharstringType
     let data = build_cff_full(&extra, true, None, &[14], &[14]);
-    assert!(CffFont::parse(&data, 0).is_err(), "CharstringType 3 must be rejected");
+    assert!(CffFont::parse(&data, 0, &mut OutlineEncoder).is_err(), "CharstringType 3 must be rejected");
 }
 
 #[test]
@@ -434,7 +438,7 @@ fn c19b_missing_private_dict_is_not_fatal() {
     push_int(500, &mut cs); // delta width
     cs.push(14); // endchar
     let data = build_cff_full(&[], false, None, &[14], &cs);
-    let font = CffFont::parse(&data, 0).expect("a font without Private parses");
+    let font = CffFont::parse(&data, 0, &mut OutlineEncoder).expect("a font without Private parses");
     assert_eq!(font.glyph(GlyphId(1)).expect("glyph 1").metrics.advance, 500.0);
 }
 
@@ -443,7 +447,7 @@ fn c19c_unknown_charset_format_is_an_error() {
     // charset formats are 0, 1 and 2 (CFF §"Charset"); format 3 used to panic.
     let tail = [3u8];
     let data = build_cff_full(&[], true, Some(&tail), &[14], &[14]);
-    assert!(CffFont::parse(&data, 0).is_err(), "charset format 3 must be rejected");
+    assert!(CffFont::parse(&data, 0, &mut OutlineEncoder).is_err(), "charset format 3 must be rejected");
 }
 
 #[test]
@@ -456,7 +460,7 @@ fn c19d_index_offset_zero_is_an_error() {
     data.extend_from_slice(&index(&[])); // Top DICT INDEX
     data.extend_from_slice(&index(&[])); // String INDEX
     data.extend_from_slice(&index(&[])); // GlobalSubr INDEX
-    assert!(CffFont::parse(&data, 0).is_err(), "INDEX offset 0 must be rejected");
+    assert!(CffFont::parse(&data, 0, &mut OutlineEncoder).is_err(), "INDEX offset 0 must be rejected");
 }
 
 // ---------------------------- endchar seac ----------------------------
@@ -501,14 +505,14 @@ fn c24_endchar_seac_composes_the_accent() {
         &seac2(100, 200, 65, 194),
     ];
     let data = build_cff_glyphs(&[], true, Some(&tail), charstrings);
-    let font = CffFont::parse(&data, 0).expect("font parses");
+    let font = CffFont::parse(&data, 0, &mut OutlineEncoder).expect("font parses");
 
     let a = font.gid_for_name("A").expect("/A");
     let acute = font.gid_for_name("acute").expect("/acute");
     let aacute = font.gid_for_name("Aacute").expect("/Aacute");
-    let glyph_a = font.glyph(a).expect("glyph A");
-    let glyph_accent = font.glyph(acute).expect("glyph acute");
-    let composed = font.glyph(aacute).expect("glyph Aacute");
+    let glyph_a = outline(&font, a);
+    let glyph_accent = outline(&font, acute);
+    let composed = outline(&font, aacute);
 
     let base_pts = points(&glyph_a);
     let accent_pts = points(&glyph_accent);
@@ -544,11 +548,11 @@ fn c24b_endchar_seac_needs_exactly_four_operands() {
         &garbage,
     ];
     let data = build_cff_glyphs(&[], true, Some(&tail), charstrings);
-    let font = CffFont::parse(&data, 0).expect("font parses");
+    let font = CffFont::parse(&data, 0, &mut OutlineEncoder).expect("font parses");
     let aacute = font.gid_for_name("Aacute").expect("/Aacute");
-    let glyph = font.glyph(aacute).expect("glyph Aacute");
+    let glyph = outline(&font, aacute);
     assert!(
-        glyph.path.contours().is_empty(),
+        glyph.contours().is_empty(),
         "five operands are not a seac: nothing must be composed"
     );
 
@@ -563,12 +567,12 @@ fn c24b_endchar_seac_needs_exactly_four_operands() {
         &wide,
     ];
     let data = build_cff_glyphs(&[], true, Some(&tail), charstrings);
-    let font = CffFont::parse(&data, 0).expect("font parses");
+    let font = CffFont::parse(&data, 0, &mut OutlineEncoder).expect("font parses");
     let a = font.gid_for_name("A").expect("/A");
     let acute = font.gid_for_name("acute").expect("/acute");
-    let composed = font.glyph(font.gid_for_name("Aacute").expect("/Aacute")).expect("glyph");
-    let base_pts = points(&font.glyph(a).expect("glyph A"));
-    let accent_pts = points(&font.glyph(acute).expect("glyph acute"));
+    let composed = outline(&font, font.gid_for_name("Aacute").expect("/Aacute"));
+    let base_pts = points(&outline(&font, a));
+    let accent_pts = points(&outline(&font, acute));
     let composed_pts = points(&composed);
     assert_eq!(composed_pts.len(), base_pts.len() + accent_pts.len());
     for (i, &(x, y)) in accent_pts.iter().enumerate() {
@@ -609,7 +613,7 @@ fn c27_type2_recursive_gsubr_is_rejected() {
     );
 
     // Parsing must return — the guard fires at depth MAX_SUBR_DEPTH.
-    let result = CffFont::parse(&data, 0);
+    let result = CffFont::parse(&data, 0, &mut OutlineEncoder);
     assert!(
         result.is_err(),
         "a self-recursive global subr must fail the charstring, not hang"
@@ -644,8 +648,8 @@ fn c27b_type2_nested_gsubr_still_runs() {
         &[subr0.as_slice(), subr1.as_slice()],
         &[&[14], cs1.as_slice()],
     );
-    let font = CffFont::parse(&data, 0).expect("two-level subr nesting is legal");
-    let glyph = font.glyph(GlyphId(1)).expect("glyph 1");
+    let font = CffFont::parse(&data, 0, &mut OutlineEncoder).expect("two-level subr nesting is legal");
+    let glyph = outline(&font, GlyphId(1));
     assert_eq!(points(&glyph), vec![(0.0, 0.0)]);
 }
 
@@ -736,7 +740,7 @@ fn c28b_type2_transient_index_out_of_range_is_an_error() {
     cs.push(14); // endchar
 
     let data = build_cff(&[14], &cs);
-    assert!(CffFont::parse(&data, 0).is_err());
+    assert!(CffFont::parse(&data, 0, &mut OutlineEncoder).is_err());
 }
 
 #[test]
@@ -795,7 +799,7 @@ fn c18_encoding_supplement_may_name_a_missing_glyph() {
     let cs = vec![14]; // endchar
     let data = build_cff_with_encoding(&encoding, &[&cs, &cs]);
 
-    let font = CffFont::parse(&data, 0).expect("a supplement naming a missing SID is not fatal");
+    let font = CffFont::parse(&data, 0, &mut OutlineEncoder).expect("a supplement naming a missing SID is not fatal");
     assert_eq!(font.gid_for_codepoint(65), Some(GlyphId(34)), "known SID still maps");
     assert_eq!(font.gid_for_codepoint(66), None, "the missing SID maps to no glyph");
 }
@@ -807,7 +811,7 @@ fn c17_last_charset_glyph_is_in_the_unicode_map() {
     // gid 2 = SID 2 ("exclam"), the last glyph in the font.
     let cs = vec![14]; // endchar
     let data = build_cff_glyphs(&[], true, None, &[&cs, &cs, &cs]);
-    let font = CffFont::parse(&data, 0).expect("font parses");
+    let font = CffFont::parse(&data, 0, &mut OutlineEncoder).expect("font parses");
 
     assert_eq!(font.num_glyphs(), 3);
     assert_eq!(font.gid_for_unicode_codepoint(0x20), Some(GlyphId(1)), "\"space\" is gid 1");
@@ -821,7 +825,7 @@ fn c17b_zero_char_strings_does_not_panic() {
     // subtraction is unreachable today; the loop still uses `saturating_sub` and this asserts
     // the guarantee it relies on rather than a panic.
     let data = build_cff_glyphs(&[], true, None, &[]);
-    assert!(CffFont::parse(&data, 0).is_err(), "a font without .notdef is rejected");
+    assert!(CffFont::parse(&data, 0, &mut OutlineEncoder).is_err(), "a font without .notdef is rejected");
 }
 
 #[test]
@@ -836,7 +840,7 @@ fn c47_cff_name_and_weight_come_from_the_name_index_and_top_dict() {
     }
     let strings: &[&[u8]] = &[b"Helvetia", b"SemiBold", b"Helvetia SemiBold"];
     let data = build_cff_with_strings(&top_dict, strings);
-    let font = CffFont::parse(&data, 0).expect("font parses");
+    let font = CffFont::parse(&data, 0, &mut OutlineEncoder).expect("font parses");
 
     let name = font.name();
     assert_eq!(name.family.as_deref(), Some("Helvetia"), "FamilyName SID 391");
@@ -850,7 +854,7 @@ fn c47b_cff_without_a_family_name_falls_back_to_the_font_name() {
     // A bare CFF font need not carry FamilyName/Weight; the Name INDEX still gives the
     // PostScript name, and nothing is invented where the Top DICT has no entry.
     let data = build_cff(&[14], &[14]);
-    let font = CffFont::parse(&data, 0).expect("font parses");
+    let font = CffFont::parse(&data, 0, &mut OutlineEncoder).expect("font parses");
 
     let name = font.name();
     assert_eq!(name.postscript_name.as_deref(), Some("Test"));
